@@ -7,7 +7,6 @@ import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from dbCon import DB_CONFIG
@@ -31,14 +30,6 @@ pool = None
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(**DB_CONFIG)
-
-
-# ================= FSM =================
-
-class SubState(StatesGroup):
-    name = State()
-    amount = State()
-    date = State()
 
 
 # ================= DATE =================
@@ -126,8 +117,8 @@ def kb():
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
+    user_states.pop(message.from_user.id, None)
     await add_user(message.from_user.id, message.from_user.username)
-
     await message.answer("💳 Бот подписок", reply_markup=kb())
 
 
@@ -142,9 +133,15 @@ async def add(message: types.Message):
     await message.answer("Введите название")
 
 
+# ================= ОБРАБОТКА =================
+
 @dp.message()
 async def handler(message: types.Message):
     uid = message.from_user.id
+
+    # ❗ игнор кнопок
+    if message.text in ["➕ Добавить", "📋 Список", "📊 Статистика"]:
+        return
 
     if uid not in user_states:
         return
@@ -179,7 +176,6 @@ async def handler(message: types.Message):
         )
 
         user_states.pop(uid, None)
-
         await message.answer("✅ Добавлено", reply_markup=kb())
 
 
@@ -187,39 +183,67 @@ async def handler(message: types.Message):
 
 @dp.message(lambda m: m.text == "📋 Список")
 async def list_subs(message: types.Message):
+    user_states.pop(message.from_user.id, None)
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT s.name, s.amount, s.next_payment_date
             FROM subscriptions s
             JOIN users u ON u.id = s.user_id
             WHERE u.telegram_id = $1
+            ORDER BY s.next_payment_date
         """, message.from_user.id)
 
     if not rows:
-        await message.answer("Нет подписок")
+        await message.answer("❌ Нет подписок")
         return
 
     text = "📋 Подписки:\n\n"
 
     for r in rows:
-        text += f"{r['name']} — {r['amount']}₽ — {r['next_payment_date']}\n"
+        date = r["next_payment_date"]
+
+        if isinstance(date, datetime):
+            date = date.date()
+
+        text += f"🔹 {r['name']}\n"
+        text += f"   💰 {r['amount']}₽\n"
+        text += f"   📅 {date}\n\n"
 
     await message.answer(text)
 
 
 # ================= STATS =================
 
+def calc_monthly(amount, period):
+    if period == "monthly":
+        return amount
+    if period == "yearly":
+        return amount / 12
+    if period == "weekly":
+        return amount * 4
+    return amount
+
+
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def stats(message: types.Message):
+    user_states.pop(message.from_user.id, None)
+
     async with pool.acquire() as conn:
-        total = await conn.fetchval("""
-            SELECT COALESCE(SUM(s.amount),0)
+        rows = await conn.fetch("""
+            SELECT s.amount, s.billing_period
             FROM subscriptions s
             JOIN users u ON u.id = s.user_id
             WHERE u.telegram_id = $1
         """, message.from_user.id)
 
-    await message.answer(f"💸 Всего в месяц: {total}₽")
+    total = sum(calc_monthly(r["amount"], r["billing_period"]) for r in rows)
+
+    await message.answer(
+        f"📊 Статистика:\n\n"
+        f"💸 В месяц: {round(total,2)}₽\n"
+        f"📦 Подписок: {len(rows)}"
+    )
 
 
 # ================= NOTIFICATIONS =================
@@ -235,9 +259,7 @@ async def notification_loop():
             for r in rows:
                 date = r["next_payment_date"]
 
-                if isinstance(date, str):
-                    date = datetime.strptime(date, "%Y-%m-%d").date()
-                elif isinstance(date, datetime):
+                if isinstance(date, datetime):
                     date = date.date()
 
                 key = (r["telegram_id"], r["name"], str(date))
@@ -245,11 +267,10 @@ async def notification_loop():
                 if key in sent:
                     continue
 
-                # 🔥 ВЫДАЁМ ВСЕ НАПОМИНАНИЯ (сегодня + завтра)
                 if (date - today).days in [0, 1]:
                     await bot.send_message(
                         r["telegram_id"],
-                        f"⏰ Напоминание: {r['name']} ({date}) — {r['amount'] if 'amount' in r else ''}"
+                        f"⏰ Напоминание: {r['name']} ({date}) — {r['amount']}₽"
                     )
                     sent.add(key)
 
@@ -269,4 +290,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
