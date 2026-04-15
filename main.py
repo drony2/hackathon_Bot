@@ -1,269 +1,329 @@
 import asyncio
-import json
 import logging
 from datetime import datetime, timedelta
 
-import asyncpg
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
+import aiosqlite
 
-from dbCon import DB_CONFIG
-
-# ================= CONFIG =================
-
-with open('package.json', 'r', encoding='utf-8') as file:
-    data = json.load(file)
+API_TOKEN = "YOUR_BOT_TOKEN"
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=data.get('token'))
-dp = Dispatcher(storage=MemoryStorage())
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 
-pool = None
+DB_NAME = "subscriptions.db"
 
-# ================= DB =================
+user_states = {}
+
+# ------------------ БАЗА ------------------
 
 async def init_db():
-    global pool
-    pool = await asyncpg.create_pool(**DB_CONFIG)
+    async with aiosqlite.connect(DB_NAME) as db:
 
-
-# ================= FSM =================
-
-class SubState(StatesGroup):
-    name = State()
-    amount = State()
-    date = State()
-
-
-# ================= DATE =================
-
-def parse_date(text: str):
-    formats = ["%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y/%m/%d"]
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt).date()
-        except:
-            pass
-
-    return None
-
-
-# ================= DB FUNCTIONS =================
-
-async def add_user(tg_id, username):
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (telegram_id, username)
-            VALUES ($1, $2)
-            ON CONFLICT (telegram_id) DO NOTHING
-        """, tg_id, username)
-
-
-async def add_subscription(tg_id, name, amount, date):
-    async with pool.acquire() as conn:
-
-        user = await conn.fetchrow("""
-            SELECT id FROM users WHERE telegram_id = $1
-        """, tg_id)
-
-        if not user:
-            return
-
-        await conn.execute("""
-            INSERT INTO subscriptions (
-                user_id,
-                name,
-                amount,
-                next_payment_date,
-                currency,
-                billing_period,
-                billing_interval,
-                status
-            )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        """,
-        user["id"],
-        name,
-        amount,
-        date,
-        "RUB",
-        "monthly",
-        1,
-        "active"
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE,
+            username TEXT
         )
-
-
-async def get_all_subscriptions():
-    async with pool.acquire() as conn:
-        return await conn.fetch("""
-            SELECT u.telegram_id, s.name, s.next_payment_date, s.amount
-            FROM subscriptions s
-            JOIN users u ON u.id = s.user_id
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            amount REAL,
+            billing_period TEXT,
+            next_payment_date TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """)
 
-# ================= UI =================
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscription_id INTEGER,
+            amount REAL,
+            payment_date TEXT
+        )
+        """)
 
-def kb():
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            monthly_limit REAL
+        )
+        """)
+
+        await db.commit()
+
+
+# ------------------ КНОПКИ ------------------
+
+def get_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Добавить")],
-            [KeyboardButton(text="📋 Список")],
-            [KeyboardButton(text="📊 Статистика")]
+            [KeyboardButton(text="➕ Добавить подписку")],
+            [KeyboardButton(text="📋 Мои подписки")],
+            [KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="💰 Установить лимит")]
         ],
         resize_keyboard=True
     )
 
 
-# ================= START =================
+# ------------------ /start ------------------
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    await add_user(message.from_user.id, message.from_user.username)
+    user_states.pop(message.from_user.id, None)
 
-    await message.answer("💳 Бот подписок", reply_markup=kb())
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, username) VALUES (?, ?)",
+            (message.from_user.id, message.from_user.username)
+        )
+        await db.commit()
+
+    await message.answer("💳 Бот учёта подписок", reply_markup=get_kb())
 
 
-# ================= FSM =================
+# ------------------ FSM ------------------
 
-user_states = {}
-
-
-@dp.message(lambda m: m.text == "➕ Добавить")
-async def add(message: types.Message):
+@dp.message(lambda m: m.text == "➕ Добавить подписку")
+async def add_sub(message: types.Message):
     user_states[message.from_user.id] = {"step": "name"}
-    await message.answer("Введите название")
+    await message.answer("Название подписки:")
 
+
+@dp.message(lambda m: m.text == "💰 Установить лимит")
+async def set_limit(message: types.Message):
+    user_states[message.from_user.id] = {"step": "limit"}
+    await message.answer("Введите месячный лимит (€):")
+
+
+# ------------------ ОБРАБОТКА ВВОДА ------------------
 
 @dp.message()
-async def handler(message: types.Message):
+async def handle(message: types.Message):
     uid = message.from_user.id
+
+    # 🔥 игнор кнопок
+    if message.text in [
+        "➕ Добавить подписку",
+        "📋 Мои подписки",
+        "📊 Статистика",
+        "💰 Установить лимит"
+    ]:
+        return
 
     if uid not in user_states:
         return
 
     state = user_states[uid]
 
-    if state["step"] == "name":
+    # -------- лимит --------
+    if state["step"] == "limit":
+        try:
+            limit = float(message.text)
+
+            async with aiosqlite.connect(DB_NAME) as db:
+                cur = await db.execute(
+                    "SELECT id FROM users WHERE telegram_id = ?",
+                    (uid,))
+                user_id = (await cur.fetchone())[0]
+
+                await db.execute("""
+                    INSERT OR REPLACE INTO budgets (user_id, monthly_limit)
+                    VALUES (?, ?)
+                """, (user_id, limit))
+                await db.commit()
+
+            user_states.pop(uid)
+            await message.answer("✅ Лимит сохранён")
+
+        except:
+            await message.answer("Введите число!")
+
+    # -------- подписка --------
+    elif state["step"] == "name":
         state["name"] = message.text
         state["step"] = "amount"
-        await message.answer("Введите сумму")
+        await message.answer("Сумма (€):")
 
     elif state["step"] == "amount":
         try:
             state["amount"] = float(message.text)
-            state["step"] = "date"
-            await message.answer("Введите дату (YYYY-MM-DD или DD.MM.YYYY)")
+            state["step"] = "period"
+            await message.answer("Период (monthly/yearly/weekly):")
         except:
-            await message.answer("Введите число")
+            await message.answer("Введите число!")
 
-    elif state["step"] == "date":
-        date = parse_date(message.text)
-
-        if not date:
-            await message.answer("❌ Неверная дата")
+    elif state["step"] == "period":
+        if message.text not in ["monthly", "yearly", "weekly"]:
+            await message.answer("Введите: monthly / yearly / weekly")
             return
 
-        await add_subscription(
-            uid,
-            state["name"],
-            state["amount"],
-            date
-        )
+        state["period"] = message.text
+        state["step"] = "date"
+        await message.answer("Дата платежа (YYYY-MM-DD):")
 
-        user_states.pop(uid, None)
+    elif state["step"] == "date":
+        try:
+            datetime.strptime(message.text, "%Y-%m-%d")
 
-        await message.answer("✅ Добавлено", reply_markup=kb())
+            async with aiosqlite.connect(DB_NAME) as db:
+                cur = await db.execute(
+                    "SELECT id FROM users WHERE telegram_id = ?",
+                    (uid,))
+                user_id = (await cur.fetchone())[0]
+
+                await db.execute("""
+                    INSERT INTO subscriptions 
+                    (user_id, name, amount, billing_period, next_payment_date)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (user_id, state["name"], state["amount"],
+                      state["period"], message.text))
+
+                await db.commit()
+
+            user_states.pop(uid)
+            await message.answer("✅ Подписка добавлена")
+
+        except:
+            await message.answer("Неверная дата!")
 
 
-# ================= LIST =================
+# ------------------ СПИСОК ------------------
 
-@dp.message(lambda m: m.text == "📋 Список")
+@dp.message(lambda m: m.text == "📋 Мои подписки")
 async def list_subs(message: types.Message):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT s.name, s.amount, s.next_payment_date
+    user_states.pop(message.from_user.id, None)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute("""
+            SELECT name, amount, billing_period, next_payment_date
             FROM subscriptions s
-            JOIN users u ON u.id = s.user_id
-            WHERE u.telegram_id = $1
-        """, message.from_user.id)
+            JOIN users u ON s.user_id = u.id
+            WHERE u.telegram_id = ?
+            ORDER BY next_payment_date
+        """, (message.from_user.id,))
+        
+        rows = await cur.fetchall()
 
     if not rows:
-        await message.answer("Нет подписок")
+        await message.answer("❌ У тебя нет подписок")
         return
 
-    text = "📋 Подписки:\n\n"
+    text = "📋 Твои подписки:\n\n"
 
-    for r in rows:
-        text += f"{r['name']} — {r['amount']}₽ — {r['next_payment_date']}\n"
+    for name, amount, period, date in rows:
+        try:
+            d = datetime.strptime(date, "%Y-%m-%d")
+            date_str = d.strftime("%d.%m.%Y")
+        except:
+            date_str = date
+
+        text += f"🔹 {name}\n"
+        text += f"   💰 {amount}€ ({period})\n"
+        text += f"   📅 {date_str}\n\n"
 
     await message.answer(text)
 
 
-# ================= STATS =================
+# ------------------ СТАТИСТИКА ------------------
+
+def calc_monthly(amount, period):
+    if period == "monthly":
+        return amount
+    if period == "yearly":
+        return amount / 12
+    if period == "weekly":
+        return amount * 4
+    return amount
+
+
+async def get_budget(tg_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute("""
+            SELECT monthly_limit FROM budgets b
+            JOIN users u ON b.user_id = u.id
+            WHERE u.telegram_id = ?
+        """, (tg_id,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
 
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def stats(message: types.Message):
-    async with pool.acquire() as conn:
-        total = await conn.fetchval("""
-            SELECT COALESCE(SUM(s.amount),0)
+    user_states.pop(message.from_user.id, None)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        cur = await db.execute("""
+            SELECT amount, billing_period
             FROM subscriptions s
-            JOIN users u ON u.id = s.user_id
-            WHERE u.telegram_id = $1
-        """, message.from_user.id)
+            JOIN users u ON s.user_id = u.id
+            WHERE u.telegram_id = ?
+        """, (message.from_user.id,))
+        subs = await cur.fetchall()
 
-    await message.answer(f"💸 Всего в месяц: {total}₽")
+    monthly_total = sum(calc_monthly(a, p) for a, p in subs)
+
+    text = f"📊 Статистика:\n\n"
+    text += f"💸 В месяц: {round(monthly_total,2)}€\n"
+    text += f"📦 Подписок: {len(subs)}\n"
+
+    limit = await get_budget(message.from_user.id)
+    if limit:
+        text += f"\n🎯 Лимит: {limit}€\n"
+        if monthly_total > limit:
+            text += "🚨 Превышение!"
+        else:
+            text += f"✅ Осталось: {round(limit-monthly_total,2)}€"
+
+    await message.answer(text)
 
 
-# ================= NOTIFICATIONS =================
+# ------------------ НАПОМИНАНИЯ ------------------
 
-async def notification_loop():
-    sent = set()
-
+async def reminder_loop():
     while True:
-        try:
-            rows = await get_all_subscriptions()
-            today = datetime.now().date()
+        async with aiosqlite.connect(DB_NAME) as db:
+            cur = await db.execute("""
+                SELECT u.telegram_id, s.name, s.next_payment_date
+                FROM subscriptions s
+                JOIN users u ON s.user_id = u.id
+            """)
+            rows = await cur.fetchall()
 
-            for r in rows:
-                date = r["next_payment_date"]
+        today = datetime.now().date()
 
-                if isinstance(date, str):
-                    date = datetime.strptime(date, "%Y-%m-%d").date()
-                elif isinstance(date, datetime):
-                    date = date.date()
+        for tg_id, name, date_str in rows:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
 
-                key = (r["telegram_id"], r["name"], str(date))
+            if d - today == timedelta(days=1):
+                try:
+                    await bot.send_message(tg_id, f"⏰ Завтра: {name}")
+                except:
+                    pass
 
-                if key in sent:
-                    continue
-
-                # 🔥 ВЫДАЁМ ВСЕ НАПОМИНАНИЯ (сегодня + завтра)
-                if (date - today).days in [0, 1]:
-                    await bot.send_message(
-                        r["telegram_id"],
-                        f"⏰ Напоминание: {r['name']} ({date}) — {r['amount'] if 'amount' in r else ''}"
-                    )
-                    sent.add(key)
-
-        except Exception as e:
-            print("LOOP ERROR:", e)
-
-        await asyncio.sleep(10)
+        await asyncio.sleep(86400)
 
 
-# ================= MAIN =================
+# ------------------ RUN ------------------
+
 
 async def main():
     await init_db()
-    asyncio.create_task(notification_loop())
+    asyncio.create_task(reminder_loop())
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
+
