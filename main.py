@@ -24,7 +24,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 pool = None
 
-
 # ================= DB =================
 
 async def init_db():
