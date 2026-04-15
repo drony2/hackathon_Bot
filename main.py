@@ -12,7 +12,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from dbCon import DB_CONFIG
 
-
 # ================= CONFIG =================
 
 with open('package.json', 'r', encoding='utf-8') as file:
