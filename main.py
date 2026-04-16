@@ -58,21 +58,20 @@ async def init_db():
 
         # Обновляем таблицу budgets для поддержки валют
         try:
-            await conn.execute("""
-                               ALTER TABLE budgets
-                                   ADD COLUMN IF NOT EXISTS currency VARCHAR (10) DEFAULT 'RUB'
-                               """)
+            await conn.execute("ALTER TYPE status_enum ADD VALUE IF NOT EXISTS 'paused'")
         except Exception as e:
-            logging.warning(f"Could not add currency column: {e}")
-
-        # Добавляем колонку reminded_today
-        try:
-            await conn.execute("""
-                               ALTER TABLE subscriptions
-                                   ADD COLUMN IF NOT EXISTS reminded_today BOOLEAN DEFAULT FALSE
-                               """)
-        except Exception as e:
-            logging.warning(f"Could not add reminded_today column: {e}")
+            # Если IF NOT EXISTS не поддерживается, пробуем через проверку
+            try:
+                result = await conn.fetchval("""
+                                             SELECT EXISTS (SELECT 1
+                                                            FROM pg_enum
+                                                            WHERE enumlabel = 'paused'
+                                                              AND enumtypid = 'status_enum'::regtype)
+                                             """)
+                if not result:
+                    await conn.execute("ALTER TYPE status_enum ADD VALUE 'paused'")
+            except Exception as e2:
+                logging.warning(f"Could not add 'paused' to enum: {e2}")
 
 # ================= FSM =================
 
@@ -83,6 +82,8 @@ class AddSub(StatesGroup):
     period = State()
     date = State()
 
+class ResumeSub(StatesGroup):
+    waiting_for_date = State()
 
 class SetBudget(StatesGroup):
     currency = State()
@@ -428,10 +429,11 @@ def budget_currency_kb():
 
 
 def action_kb(sub_id):
+    """Клавиатура для уведомлений (всегда active)"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Продлить", callback_data=f"renew_{sub_id}"),
-            InlineKeyboardButton(text="❌ Завершить", callback_data=f"skip_{sub_id}")
+            InlineKeyboardButton(text="⏸ Приостановить", callback_data=f"pause_{sub_id}")
         ],
         [
             InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{sub_id}"),
@@ -646,28 +648,47 @@ async def date(m: types.Message, state: FSMContext):
 async def list_subs(m: types.Message):
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-                                SELECT s.id, s.name, s.amount, s.currency, s.next_payment_date, s.period_days
+                                SELECT s.id, s.name, s.amount, s.currency, s.next_payment_date, s.period_days, s.status
                                 FROM subscriptions s
                                          JOIN users u ON u.id = s.user_id
                                 WHERE u.telegram_id = $1
-                                ORDER BY next_payment_date
+                                ORDER BY CASE WHEN s.status = 'active' THEN 0 ELSE 1 END,
+                                         s.next_payment_date
                                 """, m.from_user.id)
 
     if not rows:
         await m.answer("📭 У вас пока нет подписок", reply_markup=main_kb())
         return
 
-    for r in rows:
-        date = r["next_payment_date"].strftime("%d.%m.%Y")
+    # Разделяем на активные и приостановленные
+    active_subs = [r for r in rows if r["status"] == "active"]
+    paused_subs = [r for r in rows if r["status"] != "active"]
 
-        text = (
-            f"📌 {r['name']}\n"
-            f"💰 {r['amount']} {r['currency']}\n"
-            f"📅 Следующий платёж: {date}\n"
-            f"🔁 Период: {r['period_days']} дней"
-        )
+    if active_subs:
+        await m.answer("🟢 **АКТИВНЫЕ ПОДПИСКИ:**")
+        for r in active_subs:
+            date = r["next_payment_date"].strftime("%d.%m.%Y")
+            text = (
+                f"📌 {r['name']}\n"
+                f"💰 {r['amount']} {r['currency']}\n"
+                f"📅 Следующий платёж: {date}\n"
+                f"🔁 Период: {r['period_days']} дней\n"
+                f"🟢 Статус: Активна"
+            )
+            await m.answer(text, reply_markup=list_action_kb(r['id'], r['status']))
 
-        await m.answer(text, reply_markup=action_kb(r['id']))
+    if paused_subs:
+        await m.answer("🔴 **ПРИОСТАНОВЛЕННЫЕ ПОДПИСКИ:**")
+        for r in paused_subs:
+            date = r["next_payment_date"].strftime("%d.%m.%Y")
+            text = (
+                f"📌 {r['name']}\n"
+                f"💰 {r['amount']} {r['currency']}\n"
+                f"📅 Платёж был: {date}\n"
+                f"🔁 Период: {r['period_days']} дней\n"
+                f"🔴 Статус: Приостановлена"
+            )
+            await m.answer(text, reply_markup=list_action_kb(r['id'], r['status']))
 
     await m.answer("👆 Это все ваши подписки", reply_markup=main_kb())
 
@@ -1089,14 +1110,15 @@ async def notification_loop():
     while True:
         try:
             async with pool.acquire() as conn:
+                # Только активные подписки
                 rows = await conn.fetch("""
                     SELECT s.*, u.telegram_id
                     FROM subscriptions s
                     JOIN users u ON u.id = s.user_id
+                    WHERE s.status = 'active'
                 """)
 
             today = datetime.now().date()
-            print(f"\n🔍 Проверка уведомлений. Сегодня: {today}")
 
             for r in rows:
                 try:
@@ -1109,33 +1131,26 @@ async def notification_loop():
                         f"📌 {r['name']}\n"
                         f"💰 {r['amount']} {r['currency']}\n"
                         f"📅 Списание: {pay_date}\n"
-                        f"🔁 Период: {r['period_days']} дней\n\n"
+                        f"🔁 Период: {r['period_days']} дней\n"
+                        f"🟢 Статус: Активна\n\n"
                         f"💡 На что можно потратить эти деньги:\n{ideas}"
                     )
 
-                    # ===== 3 дня =====
+                    # 3 дня
                     if delta == 3 and not r["reminded_3d"]:
                         await bot.send_message(r["telegram_id"], "⏳ Через 3 дня спишется:\n\n" + text)
                         await add_notification(r["telegram_id"], r["id"], today, "reminder_3d")
-
                         async with pool.acquire() as conn2:
-                            await conn2.execute("""
-                                UPDATE subscriptions SET reminded_3d = TRUE WHERE id = $1
-                            """, r["id"])
-                        print(f"✅ 3 дня: {r['name']}")
+                            await conn2.execute("UPDATE subscriptions SET reminded_3d = TRUE WHERE id = $1", r["id"])
 
-                    # ===== 1 день =====
+                    # 1 день
                     if delta == 1 and not r["reminded_1d"]:
                         await bot.send_message(r["telegram_id"], "⏰ Завтра спишется:\n\n" + text)
                         await add_notification(r["telegram_id"], r["id"], today, "reminder_1d")
-
                         async with pool.acquire() as conn2:
-                            await conn2.execute("""
-                                UPDATE subscriptions SET reminded_1d = TRUE WHERE id = $1
-                            """, r["id"])
-                        print(f"✅ 1 день: {r['name']}")
+                            await conn2.execute("UPDATE subscriptions SET reminded_1d = TRUE WHERE id = $1", r["id"])
 
-                    # ===== сегодня (только уведомление, без обновления даты) =====
+                    # Сегодня
                     if delta == 0:
                         reminded_today = r.get("reminded_today", False)
                         if not reminded_today:
@@ -1144,27 +1159,9 @@ async def notification_loop():
                                 "💸 Сегодня списание:\n\n" + text,
                                 reply_markup=action_kb(r["id"])
                             )
-
-                            await add_payment_record(
-                                r["telegram_id"],
-                                r["id"],
-                                float(r["amount"]),
-                                today,
-                                "paid"
-                            )
-
                             await add_notification(r["telegram_id"], r["id"], today, "payment_due")
-
-                            # Только отмечаем, что уведомили сегодня, НЕ обновляем дату!
                             async with pool.acquire() as conn2:
-                                await conn2.execute("""
-                                    UPDATE subscriptions SET reminded_today = TRUE WHERE id = $1
-                                """, r["id"])
-                            print(f"✅ Сегодня (уведомление): {r['name']}")
-
-                    # ===== просрочено =====
-                    if delta < 0:
-                        print(f"⚠️ Просрочено: {r['name']}, дата: {pay_date}")
+                                await conn2.execute("UPDATE subscriptions SET reminded_today = TRUE WHERE id = $1", r["id"])
 
                 except Exception as e:
                     logging.error(f"Error processing subscription {r['id']}: {e}")
@@ -1175,7 +1172,88 @@ async def notification_loop():
         except Exception as e:
             logging.error(f"Error in notification loop: {e}")
             await asyncio.sleep(60)
+
     # ================= ACTIONS =================
+
+
+@dp.callback_query(lambda c: c.data.startswith("resume_"))
+async def resume_subscription_start(c: types.CallbackQuery, state: FSMContext):
+    """Начало возобновления - спрашиваем дату"""
+    sub_id = int(c.data.split("_")[1])
+
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            "SELECT name, period_days FROM subscriptions WHERE id=$1",
+            sub_id
+        )
+
+    if sub:
+        await state.update_data(resume_sub_id=sub_id, resume_period=sub["period_days"])
+        await state.set_state(ResumeSub.waiting_for_date)
+
+        # Вычисляем дату по умолчанию (сегодня + период)
+        default_date = (datetime.now() + timedelta(days=sub["period_days"])).strftime("%d.%m.%Y")
+
+        await c.message.delete()
+        await c.message.answer(
+            f"▶️ Возобновление подписки \"{sub['name']}\"\n\n"
+            f"📅 Введите дату следующего платежа (YYYY-MM-DD или DD.MM.YYYY):\n"
+            f"💡 Например: {default_date}",
+            reply_markup=cancel_kb()
+        )
+    else:
+        await c.answer("Подписка не найдена")
+
+    await c.answer()
+
+
+@dp.message(ResumeSub.waiting_for_date)
+async def resume_subscription_finish(message: types.Message, state: FSMContext):
+    """Завершение возобновления - сохраняем дату"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        return await message.answer("❌ Возобновление отменено", reply_markup=main_kb())
+
+    d = parse_date(message.text)
+    if not d:
+        return await message.answer("❌ Неверный формат даты. Используйте YYYY-MM-DD или DD.MM.YYYY")
+
+    today = datetime.now().date()
+    if d < today:
+        return await message.answer(
+            f"❌ Нельзя указать прошедшую дату!\n"
+            f"📅 Сегодня: {today.strftime('%d.%m.%Y')}\n"
+            f"Пожалуйста, введите будущую дату:"
+        )
+
+    data = await state.get_data()
+    sub_id = data["resume_sub_id"]
+
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            "SELECT name FROM subscriptions WHERE id=$1",
+            sub_id
+        )
+
+        if sub:
+            await conn.execute("""
+                               UPDATE subscriptions
+                               SET status            = 'active',
+                                   next_payment_date = $1,
+                                   reminded_3d       = FALSE,
+                                   reminded_1d       = FALSE,
+                                   reminded_today    = FALSE
+                               WHERE id = $2
+                               """, d, sub_id)
+
+            await message.answer(
+                f"▶️ Подписка \"{sub['name']}\" возобновлена!\n"
+                f"📅 Следующий платёж: {d.strftime('%d.%m.%Y')}\n"
+                f"🟢 Уведомления включены.",
+                reply_markup=main_kb()
+            )
+
+    await state.clear()
 
 @dp.callback_query(lambda c: c.data.startswith("del_"))
 async def delete(c: types.CallbackQuery):
@@ -1184,8 +1262,62 @@ async def delete(c: types.CallbackQuery):
     async with pool.acquire() as conn:
         sub = await conn.fetchrow("SELECT name FROM subscriptions WHERE id=$1", sub_id)
         await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
-    await c.message.edit_text(f"❌ Подписка \"{sub['name']}\" удалена")
-    await c.answer(f"Подписка {sub['name']} удалена")
+
+    await c.message.edit_text(f"🗑 Подписка \"{sub['name']}\" удалена")
+    await c.answer("Подписка удалена")
+
+
+# Вместо 'paused' используем 'inactive'
+@dp.callback_query(lambda c: c.data.startswith("pause_"))
+async def pause_subscription(c: types.CallbackQuery):
+    sub_id = int(c.data.split("_")[1])
+
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow(
+            "SELECT name FROM subscriptions WHERE id=$1",
+            sub_id
+        )
+
+        if sub:
+            await conn.execute("""
+                               UPDATE subscriptions
+                               SET status         = 'paused',
+                                   reminded_3d    = FALSE,
+                                   reminded_1d    = FALSE,
+                                   reminded_today = FALSE
+                               WHERE id = $1
+                               """, sub_id)
+
+            await c.message.edit_text(
+                f"⏸ Подписка \"{sub['name']}\" приостановлена!\n"
+                f"🔴 Уведомления отключены."
+            )
+            await c.answer("Подписка приостановлена")
+
+
+def list_action_kb(sub_id, status="active"):
+    """Клавиатура для списка подписок"""
+    if status == "active":
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Продлить", callback_data=f"renew_{sub_id}"),
+                InlineKeyboardButton(text="⏸ Приостановить", callback_data=f"pause_{sub_id}")
+            ],
+            [
+                InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{sub_id}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{sub_id}")
+            ]
+        ])
+    else:  # paused
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="▶️ Возобновить", callback_data=f"resume_{sub_id}")
+            ],
+            [
+                InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{sub_id}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{sub_id}")
+            ]
+        ])
 
 @dp.callback_query(lambda c: c.data.startswith("renew_"))
 async def renew(c: types.CallbackQuery):
@@ -1197,30 +1329,33 @@ async def renew(c: types.CallbackQuery):
             sub_id
         )
 
-        # Вычисляем новую дату
-        new_date = sub["next_payment_date"] + timedelta(days=sub["period_days"])
+        if sub:
+            # Добавляем запись об оплате
+            await conn.execute("""
+                INSERT INTO payments (subscription_id, amount, payment_date, status, created_at)
+                VALUES ($1, $2, CURRENT_DATE, 'paid', NOW())
+            """, sub_id, float(sub["amount"]))
 
-        # Обновляем дату и сбрасываем ВСЕ флаги уведомлений
-        await conn.execute("""
-            UPDATE subscriptions
-            SET next_payment_date = $1,
-                reminded_3d = FALSE,
-                reminded_1d = FALSE,
-                reminded_today = FALSE
-            WHERE id = $2
-        """, new_date, sub_id)
+            # Вычисляем новую дату
+            new_date = sub["next_payment_date"] + timedelta(days=sub["period_days"])
 
-        # Добавляем запись о платеже
-        await conn.execute("""
-            INSERT INTO payments (subscription_id, amount, payment_date, status, created_at)
-            VALUES ($1, $2, CURRENT_DATE, 'paid', NOW())
-        """, sub_id, float(sub["amount"]))
+            # Обновляем дату и сбрасываем флаги
+            await conn.execute("""
+                UPDATE subscriptions
+                SET next_payment_date = $1,
+                    reminded_3d = FALSE,
+                    reminded_1d = FALSE,
+                    reminded_today = FALSE,
+                    status = 'active'
+                WHERE id = $2
+            """, new_date, sub_id)
 
-    await c.message.edit_text(
-        f"🔁 Подписка \"{sub['name']}\" продлена!\n"
-        f"📅 Следующее списание: {new_date.strftime('%d.%m.%Y')}"
-    )
-    await c.answer("Подписка продлена")
+            await c.message.edit_text(
+                f"✅ Подписка \"{sub['name']}\" продлена!\n"
+                f"📅 Следующее списание: {new_date.strftime('%d.%m.%Y')}"
+            )
+            await c.answer("Подписка продлена")
+
 
 @dp.callback_query(lambda c: c.data.startswith("skip_"))
 async def skip(c: types.CallbackQuery):
@@ -1228,7 +1363,7 @@ async def skip(c: types.CallbackQuery):
 
     async with pool.acquire() as conn:
         sub = await conn.fetchrow(
-            "SELECT name, amount, currency FROM subscriptions WHERE id=$1",
+            "SELECT name, amount, currency, period_days, next_payment_date FROM subscriptions WHERE id=$1",
             sub_id
         )
 
@@ -1239,11 +1374,26 @@ async def skip(c: types.CallbackQuery):
                 VALUES ($1, $2, CURRENT_DATE, 'skipped', NOW())
             """, sub_id, float(sub["amount"]))
 
-        # Удаляем подписку
-        await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
+            # Вычисляем новую дату (пропускаем текущий период)
+            new_date = sub["next_payment_date"] + timedelta(days=sub["period_days"])
 
-    await c.message.edit_text(f"⏭️ Подписка \"{sub['name']}\" завершена")
-    await c.answer("Подписка завершена")
+            # Обновляем дату и сбрасываем флаги уведомлений
+            await conn.execute("""
+                UPDATE subscriptions
+                SET next_payment_date = $1,
+                    reminded_3d = FALSE,
+                    reminded_1d = FALSE,
+                    reminded_today = FALSE
+                WHERE id = $2
+            """, new_date, sub_id)
+
+    await c.message.edit_text(
+        f"⏭️ Платёж по подписке \"{sub['name']}\" пропущен!\n"
+        f"📅 Следующее списание: {new_date.strftime('%d.%m.%Y')}"
+    )
+    await c.answer("Платёж пропущен")
+
+
 # ================= ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД =================
 @dp.message()
 async def unknown_message(message: types.Message):
