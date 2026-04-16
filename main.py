@@ -142,6 +142,9 @@ def action_kb(sub_id):
         [
             InlineKeyboardButton(text="➕ Продлить", callback_data=f"renew_{sub_id}"),
             InlineKeyboardButton(text="❌ Удалить", callback_data=f"del_{sub_id}")
+        ],
+        [
+            InlineKeyboardButton(text="➡️ Не продлевать", callback_data=f"skip_{sub_id}")
         ]
     ])
 
@@ -300,12 +303,27 @@ async def notification_loop():
                 f"💡 Идеи:\n{ideas}"
             )
 
-            if delta == 3:
+            # ===== 3 дня (1 раз) =====
+            if delta == 3 and not r["reminded_3d"]:
                 await bot.send_message(r["telegram_id"], "⏳ Через 3 дня\n\n" + text)
 
-            if delta == 1:
+                await conn.execute("""
+                    UPDATE subscriptions
+                    SET reminded_3d = TRUE
+                    WHERE id=$1
+                """, r["id"])
+
+            # ===== 1 день (1 раз) =====
+            if delta == 1 and not r["reminded_1d"]:
                 await bot.send_message(r["telegram_id"], "⏰ Завтра\n\n" + text)
 
+                await conn.execute("""
+                    UPDATE subscriptions
+                    SET reminded_1d = TRUE
+                    WHERE id=$1
+                """, r["id"])
+
+            # ===== сегодня =====
             if delta <= 0:
                 await bot.send_message(
                     r["telegram_id"],
@@ -346,11 +364,22 @@ async def renew(c: types.CallbackQuery):
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE subscriptions
-            SET next_payment_date = next_payment_date + interval '30 days'
+            SET next_payment_date = next_payment_date + period_days * interval '1 day'
             WHERE id=$1
         """, sub_id)
 
-    await c.message.edit_text("🔁 Продлено на 30 дней")
+    await c.message.edit_text("🔁 Продлено")
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("skip_"))
+async def skip(c: types.CallbackQuery):
+    sub_id = int(c.data.split("_")[1])
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
+
+    await c.message.edit_text("❌ Подписка завершена")
     await c.answer()
 
 
