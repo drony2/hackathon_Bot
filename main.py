@@ -260,20 +260,43 @@ async def list_subs(m: types.Message):
 # ================= STATS =================
 
 @dp.message(lambda m: m.text == "📊 Статистика")
-async def stats(m: types.Message):
+async def stats(message: types.Message, state: FSMContext):
+    if await state.get_state():
+        await message.answer("⚠️ Сначала заверши ввод")
+        return
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT amount, currency FROM subscriptions s
+            SELECT name, amount, currency
+            FROM subscriptions s
             JOIN users u ON u.id = s.user_id
             WHERE u.telegram_id=$1
-        """, m.from_user.id)
+        """, message.from_user.id)
 
-    total = {}
+    if not rows:
+        await message.answer("❌ Нет подписок")
+        return
+
+    text = "📊 Расходы по подпискам:\n\n"
+    by_currency = {}
+
     for r in rows:
-        total[r["currency"]] = total.get(r["currency"], 0) + r["amount"]
+        cur = r["currency"]
 
-    text = "\n".join([f"{k}: {v}" for k, v in total.items()])
-    await m.answer(text or "Нет данных")
+        if cur not in by_currency:
+            by_currency[cur] = {"total": 0, "items": []}
+
+        by_currency[cur]["total"] += r["amount"]
+        by_currency[cur]["items"].append(
+            f"• {r['name']} — {r['amount']} {cur}"
+        )
+
+    for cur, data in by_currency.items():
+        text += f"\n💰 {cur}:\n"
+        text += "\n".join(data["items"])
+        text += f"\n💸 Итого: {round(data['total'], 2)} {cur}\n"
+
+    await message.answer(text)
 
 
 # ================= NOTIFICATIONS (FIXED) =================
