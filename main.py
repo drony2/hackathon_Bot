@@ -340,15 +340,15 @@ async def force_update_keyboard(user_tg_id: int):
 
 # ================= DB =================
 
-async def add_user(tg_id, username):
+async def add_user(tg_id, username, first_name):
     async with pool.acquire() as conn:
         user = await conn.fetchrow("""
-                                   INSERT INTO users (telegram_id, username)
-                                   VALUES ($1, $2) ON CONFLICT (telegram_id) DO
+                                   INSERT INTO users (telegram_id, username, first_name)
+                                   VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO
                                    UPDATE
                                        SET username = EXCLUDED.username
                                        RETURNING id
-                                   """, tg_id, username)
+                                   """, tg_id, username, first_name)
 
         if user:
             await conn.execute("""
@@ -684,7 +684,7 @@ async def cancel_inline(c: types.CallbackQuery, state: FSMContext):
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
-    await add_user(message.from_user.id, message.from_user.username)
+    await add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await force_update_keyboard(message.from_user.id)
 
     welcome_text = (
@@ -798,7 +798,7 @@ async def name(m: types.Message, state: FSMContext):
     await state.set_state(AddSub.amount)
     await m.answer(
         f"✅ Название: {clean_name}\n\n"
-        f"💰 Введите сумму (например: 199.99):",
+        f"💰 Введите сумму (например: 199.99 или 199):",
         reply_markup=cancel_kb()
     )
 
@@ -1459,11 +1459,11 @@ async def notification_loop():
                     logging.error(f"Error processing subscription {r['id']}: {e}")
                     continue
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(600)
 
         except Exception as e:
             logging.error(f"Error in notification loop: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(600)
 
 
 # ================= ACTIONS =================
