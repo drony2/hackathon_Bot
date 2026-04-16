@@ -29,7 +29,7 @@ dp = Dispatcher(storage=MemoryStorage())
 pool = None
 
 
-# ================= DB =================
+# ================= DB INIT =================
 
 async def init_db():
     global pool
@@ -58,7 +58,6 @@ def parse_date(text):
 
 
 def next_month(date):
-    # простой вариант (можно улучшить позже)
     return date + timedelta(days=30)
 
 
@@ -81,8 +80,9 @@ async def add_subscription(tg_id, data):
 
         await conn.execute("""
             INSERT INTO subscriptions
-            (user_id, name, amount, currency, next_payment_date)
-            VALUES ($1,$2,$3,$4,$5)
+            (user_id, name, amount, currency, next_payment_date,
+             reminded_3d, reminded_1d)
+            VALUES ($1,$2,$3,$4,$5,FALSE,FALSE)
         """,
         user["id"],
         data["name"],
@@ -244,12 +244,19 @@ async def stats(message: types.Message, state: FSMContext):
 
 # ================= NOTIFICATIONS =================
 
+def days_diff(date):
+    return (date - datetime.now().date()).days
+
+
 async def notification_loop():
     while True:
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch("""
-                    SELECT s.id, u.telegram_id, s.name, s.amount, s.currency, s.next_payment_date
+                    SELECT s.id, u.telegram_id, s.name, s.amount, s.currency,
+                           s.next_payment_date,
+                           s.reminded_3d,
+                           s.reminded_1d
                     FROM subscriptions s
                     JOIN users u ON u.id = s.user_id
                 """)
@@ -257,19 +264,49 @@ async def notification_loop():
                 today = datetime.now().date()
 
                 for r in rows:
-                    if r["next_payment_date"] <= today:
+                    delta_days = (r["next_payment_date"] - today).days
 
+                    # ===== 3 ДНЯ =====
+                    if delta_days == 3 and not r["reminded_3d"]:
                         await bot.send_message(
                             r["telegram_id"],
-                            f"⏰ {r['name']} — {r['amount']} {r['currency']}"
+                            f"⚠️ Через 3 дня списание: {r['name']} — {r['amount']} {r['currency']}"
+                        )
+
+                        await conn.execute("""
+                            UPDATE subscriptions
+                            SET reminded_3d = TRUE
+                            WHERE id = $1
+                        """, r["id"])
+
+                    # ===== 1 ДЕНЬ =====
+                    if delta_days == 1 and not r["reminded_1d"]:
+                        await bot.send_message(
+                            r["telegram_id"],
+                            f"⏰ Завтра списание: {r['name']} — {r['amount']} {r['currency']}"
+                        )
+
+                        await conn.execute("""
+                            UPDATE subscriptions
+                            SET reminded_1d = TRUE
+                            WHERE id = $1
+                        """, r["id"])
+
+                    # ===== СЕГОДНЯ / ПРОСРОЧЕНО =====
+                    if delta_days <= 0:
+                        await bot.send_message(
+                            r["telegram_id"],
+                            f"💸 Списание сегодня: {r['name']} — {r['amount']} {r['currency']}"
                         )
 
                         new_date = next_month(r["next_payment_date"])
 
                         await conn.execute("""
                             UPDATE subscriptions
-                            SET next_payment_date=$1
-                            WHERE id=$2
+                            SET next_payment_date = $1,
+                                reminded_3d = FALSE,
+                                reminded_1d = FALSE
+                            WHERE id = $2
                         """, new_date, r["id"])
 
         except Exception as e:
