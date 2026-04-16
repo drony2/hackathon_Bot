@@ -61,6 +61,38 @@ def next_month(date):
     return date + timedelta(days=30)
 
 
+# ================= ИДЕИ РАСХОДОВ =================
+
+def spending_ideas(amount):
+    if amount < 300:
+        return [
+            "☕ 1 кофе в кафе",
+            "🍫 небольшой перекус",
+            "📱 часть мобильной подписки"
+        ]
+    elif amount < 1000:
+        return [
+            "☕ 3–5 кофе",
+            "🍔 1–2 доставки еды",
+            "🎬 1 кино",
+            "🎧 Spotify / YouTube Premium"
+        ]
+    elif amount < 3000:
+        return [
+            "🍕 несколько доставок еды",
+            "🎮 игровая подписка",
+            "🎬 2–3 кино",
+            "📺 Netflix / сервисы"
+        ]
+    else:
+        return [
+            "🍽 регулярная доставка еды",
+            "✈️ накопления на поездку",
+            "🎮 крупные покупки в играх",
+            "📱 несколько подписок"
+        ]
+
+
 # ================= DB =================
 
 async def add_user(tg_id, username):
@@ -217,7 +249,7 @@ async def list_subs(message: types.Message, state: FSMContext):
     for r in rows:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="❌ Удалить",
+                text="❌ Удалить подписку",
                 callback_data=f"del_{r['id']}"
             )]
         ])
@@ -242,7 +274,7 @@ async def delete_subscription(callback: types.CallbackQuery):
     await callback.answer("Удалено")
 
 
-# ================= STATS (РАСШИРЕННАЯ) =================
+# ================= STATS =================
 
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def stats(message: types.Message, state: FSMContext):
@@ -264,18 +296,11 @@ async def stats(message: types.Message, state: FSMContext):
 
     text = "📊 Расходы по подпискам:\n\n"
 
-    by_currency = {}
-
     for r in rows:
         text += f"• {r['name']} — {r['amount']} {r['currency']}\n"
 
-        cur = r["currency"]
-        by_currency[cur] = by_currency.get(cur, 0) + r["amount"]
-
-    text += "\n💸 Итого:\n"
-
-    for cur, amount in by_currency.items():
-        text += f"• {round(amount, 2)} {cur}\n"
+    total = sum(r["amount"] for r in rows)
+    text += f"\n💸 Итого: {round(total, 2)}"
 
     await message.answer(text)
 
@@ -300,10 +325,15 @@ async def notification_loop():
                 for r in rows:
                     delta_days = (r["next_payment_date"] - today).days
 
+                    ideas = spending_ideas(r["amount"])
+                    ideas_text = "\n💡 На это можно потратить:\n"
+                    for i in ideas:
+                        ideas_text += f"• {i}\n"
+
                     if delta_days == 3 and not r["reminded_3d"]:
                         await bot.send_message(
                             r["telegram_id"],
-                            f"⚠️ Через 3 дня списание: {r['name']} — {r['amount']} {r['currency']}"
+                            f"{ideas_text}\n⚠️ Через 3 дня списание: {r['name']} — {r['amount']} {r['currency']}"
                         )
 
                         await conn.execute("""
@@ -315,7 +345,7 @@ async def notification_loop():
                     if delta_days == 1 and not r["reminded_1d"]:
                         await bot.send_message(
                             r["telegram_id"],
-                            f"⏰ Завтра списание: {r['name']} — {r['amount']} {r['currency']}"
+                            f"{ideas_text}\n⏰ Завтра списание: {r['name']} — {r['amount']} {r['currency']}"
                         )
 
                         await conn.execute("""
