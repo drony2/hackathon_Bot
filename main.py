@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from functools import wraps
 
 import asyncpg
 from aiogram import Bot, Dispatcher, types
@@ -29,8 +28,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 pool = None
 
-# Версия клавиатуры (увеличивайте при изменении main_kb)
-KEYBOARD_VERSION = "2.0"
+KEYBOARD_VERSION = "3.0"
 
 
 # ================= DB INIT =================
@@ -39,8 +37,8 @@ async def init_db():
     global pool
     pool = await asyncpg.create_pool(**DB_CONFIG)
 
-    # Создаём таблицу для хранения версии клавиатуры пользователя
     async with pool.acquire() as conn:
+        # Таблица настроек пользователя (исправлен SQL)
         await conn.execute("""
                            CREATE TABLE IF NOT EXISTS user_settings
                            (
@@ -58,6 +56,23 @@ async def init_db():
                                )
                            """)
 
+        # Обновляем таблицу budgets для поддержки валют
+        try:
+            await conn.execute("""
+                               ALTER TABLE budgets
+                                   ADD COLUMN IF NOT EXISTS currency VARCHAR (10) DEFAULT 'RUB'
+                               """)
+        except Exception as e:
+            logging.warning(f"Could not add currency column: {e}")
+
+        # Добавляем колонку reminded_today
+        try:
+            await conn.execute("""
+                               ALTER TABLE subscriptions
+                                   ADD COLUMN IF NOT EXISTS reminded_today BOOLEAN DEFAULT FALSE
+                               """)
+        except Exception as e:
+            logging.warning(f"Could not add reminded_today column: {e}")
 
 # ================= FSM =================
 
@@ -70,7 +85,14 @@ class AddSub(StatesGroup):
 
 
 class SetBudget(StatesGroup):
+    currency = State()
     monthly_limit = State()
+
+
+class EditSub(StatesGroup):
+    sub_id = State()
+    field = State()
+    new_value = State()
 
 
 # ================= UTILS =================
@@ -86,12 +108,15 @@ def parse_date(text):
 
 
 def next_payment(date, days):
+    """Вычисляет следующую дату платежа"""
+    if isinstance(date, str):
+        date = datetime.strptime(date, "%Y-%m-%d").date()
     return date + timedelta(days=days)
 
 
 def spending_ideas(amount):
     if amount <= 300:
-        return ["☕ кофе", "🍫 перекус", "📱 подписка"]
+        return ["☕ кофе", "🍫 перекус"]
     elif amount <= 1000:
         return ["🍔 еда", "☕ кофе", "🎬 кино"]
     elif amount <= 3000:
@@ -100,27 +125,10 @@ def spending_ideas(amount):
         return ["✈️ поездка", "🎮 покупки", "🍽 еда"]
 
 
-# ================= ДЕКОРАТОР ДЛЯ АВТООБНОВЛЕНИЯ КЛАВИАТУРЫ =================
-
-def ensure_keyboard_version(func):
-    """Декоратор для проверки и обновления версии клавиатуры"""
-
-    @wraps(func)
-    async def wrapper(message: types.Message, *args, **kwargs):
-        # Проверяем версию клавиатуры пользователя
-        if hasattr(message, 'from_user') and message.from_user:
-            await check_and_update_keyboard(message.from_user.id, message)
-
-        # Выполняем основную функцию
-        return await func(message, *args, **kwargs)
-
-    return wrapper
-
+# ================= ФУНКЦИИ КЛАВИАТУРЫ =================
 
 async def check_and_update_keyboard(user_tg_id: int, message: types.Message = None):
-    """Проверяет версию клавиатуры и обновляет при необходимости"""
     async with pool.acquire() as conn:
-        # Получаем пользователя
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
             user_tg_id
@@ -129,7 +137,6 @@ async def check_and_update_keyboard(user_tg_id: int, message: types.Message = No
         if not user:
             return False
 
-        # Проверяем версию клавиатуры
         settings = await conn.fetchrow(
             "SELECT keyboard_version FROM user_settings WHERE user_id=$1",
             user["id"]
@@ -137,9 +144,7 @@ async def check_and_update_keyboard(user_tg_id: int, message: types.Message = No
 
         current_version = settings["keyboard_version"] if settings else None
 
-        # Если версия отличается или не установлена
         if current_version != KEYBOARD_VERSION:
-            # Обновляем версию в БД
             await conn.execute("""
                                INSERT INTO user_settings (user_id, keyboard_version, updated_at)
                                VALUES ($1, $2, NOW()) ON CONFLICT (user_id) 
@@ -147,7 +152,6 @@ async def check_and_update_keyboard(user_tg_id: int, message: types.Message = No
                                UPDATE SET keyboard_version = $2, updated_at = NOW()
                                """, user["id"], KEYBOARD_VERSION)
 
-            # Если передан объект сообщения, отправляем новую клавиатуру
             if message:
                 await message.answer(
                     "🔄 Клавиатура обновлена!",
@@ -160,7 +164,6 @@ async def check_and_update_keyboard(user_tg_id: int, message: types.Message = No
 
 
 async def force_update_keyboard(user_tg_id: int):
-    """Принудительно обновляет клавиатуру пользователя"""
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -174,32 +177,6 @@ async def force_update_keyboard(user_tg_id: int):
                 DO
                                UPDATE SET keyboard_version = $2, updated_at = NOW()
                                """, user["id"], KEYBOARD_VERSION)
-
-
-# ================= ДЕКОРАТОР ДЛЯ ОБРАБОТЧИКОВ С ВОЗВРАТОМ КЛАВИАТУРЫ =================
-
-def with_keyboard_update(func):
-    """Декоратор для автоматического добавления клавиатуры к ответу"""
-
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        result = await func(*args, **kwargs)
-
-        # Ищем message в аргументах
-        message = None
-        for arg in args:
-            if isinstance(arg, types.Message):
-                message = arg
-                break
-
-        # Если функция вернула текст и есть message
-        if result and isinstance(result, str) and message:
-            await message.answer(result, reply_markup=main_kb())
-            return
-
-        return result
-
-    return wrapper
 
 
 # ================= DB =================
@@ -214,13 +191,13 @@ async def add_user(tg_id, username):
                                        RETURNING id
                                    """, tg_id, username)
 
-        # Инициализируем настройки пользователя
-        await conn.execute("""
-                           INSERT INTO user_settings (user_id, keyboard_version)
-                           VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING
-                           """, user["id"], KEYBOARD_VERSION)
+        if user:
+            await conn.execute("""
+                               INSERT INTO user_settings (user_id, keyboard_version)
+                               VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING
+                               """, user["id"], KEYBOARD_VERSION)
 
-        return user["id"]
+        return user["id"] if user else None
 
 
 async def add_subscription(tg_id, data):
@@ -233,8 +210,8 @@ async def add_subscription(tg_id, data):
         await conn.execute("""
                            INSERT INTO subscriptions
                            (user_id, name, amount, currency, next_payment_date, period_days,
-                            reminded_3d, reminded_1d)
-                           VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE)
+                            reminded_3d, reminded_1d, reminded_today)
+                           VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE, FALSE)
                            """,
                            user["id"],
                            data["name"],
@@ -245,10 +222,9 @@ async def add_subscription(tg_id, data):
                            )
 
 
-# ================= НОВЫЕ ФУНКЦИИ ДЛЯ PAYMENTS =================
+# ================= PAYMENTS =================
 
 async def add_payment_record(tg_id, subscription_id, amount, payment_date, status="paid"):
-    """Добавляет запись об оплате в таблицу payments"""
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -261,48 +237,54 @@ async def add_payment_record(tg_id, subscription_id, amount, payment_date, statu
                                """, subscription_id, amount, payment_date, status)
 
 
-async def get_payment_history(tg_id, limit=10):
-    """Получает историю платежей пользователя"""
+async def get_payment_history(tg_id, limit=20):
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-                                SELECT p.*, s.name as subscription_name, s.currency
-                                FROM payments p
-                                         JOIN subscriptions s ON s.id = p.subscription_id
-                                         JOIN users u ON u.id = s.user_id
-                                WHERE u.telegram_id = $1
-                                ORDER BY p.payment_date DESC
-                                    LIMIT $2
-                                """, tg_id, limit)
+            SELECT p.id, p.subscription_id, p.amount, p.payment_date, p.status, 
+                   s.name as subscription_name, s.currency
+            FROM payments p
+            JOIN subscriptions s ON s.id = p.subscription_id
+            JOIN users u ON u.id = s.user_id
+            WHERE u.telegram_id = $1
+            ORDER BY p.payment_date DESC, p.id DESC
+            LIMIT $2
+        """, tg_id, limit)
         return rows
 
 
-async def get_monthly_spending(tg_id, year=None, month=None):
-    """Получает траты за указанный месяц (по умолчанию текущий)"""
+async def get_monthly_spending(tg_id, currency=None, year=None, month=None):
     if year is None or month is None:
         today = datetime.now()
         year = today.year
         month = today.month
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-                                SELECT s.currency,
-                                       SUM(p.amount) as total
-                                FROM payments p
-                                         JOIN subscriptions s ON s.id = p.subscription_id
-                                         JOIN users u ON u.id = s.user_id
-                                WHERE u.telegram_id = $1
-                                  AND EXTRACT(YEAR FROM p.payment_date) = $2
-                                  AND EXTRACT(MONTH FROM p.payment_date) = $3
-                                  AND p.status = 'paid'
-                                GROUP BY s.currency
-                                """, tg_id, year, month)
+        query = """
+                SELECT s.currency, \
+                       SUM(p.amount) as total
+                FROM payments p
+                         JOIN subscriptions s ON s.id = p.subscription_id
+                         JOIN users u ON u.id = s.user_id
+                WHERE u.telegram_id = $1
+                  AND EXTRACT(YEAR FROM p.payment_date) = $2
+                  AND EXTRACT(MONTH FROM p.payment_date) = $3
+                  AND p.status = 'paid' \
+                """
+        params = [tg_id, year, month]
+
+        if currency:
+            query += " AND s.currency = $4"
+            params.append(currency)
+
+        query += " GROUP BY s.currency"
+
+        rows = await conn.fetch(query, *params)
         return rows
 
 
-# ================= НОВЫЕ ФУНКЦИИ ДЛЯ BUDGETS =================
+# ================= BUDGETS (ИСПРАВЛЕННЫЕ) =================
 
-async def set_budget(tg_id, monthly_limit):
-    """Устанавливает или обновляет месячный лимит бюджета"""
+async def set_budget(tg_id, currency, monthly_limit):
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -310,57 +292,64 @@ async def set_budget(tg_id, monthly_limit):
         )
         if user:
             existing = await conn.fetchrow(
-                "SELECT id FROM budgets WHERE user_id=$1",
-                user["id"]
+                "SELECT id FROM budgets WHERE user_id=$1 AND currency=$2",
+                user["id"], currency
             )
             if existing:
                 await conn.execute("""
-                                   UPDATE budgets
-                                   SET monthly_limit = $1
-                                   WHERE user_id = $2
-                                   """, monthly_limit, user["id"])
+                    UPDATE budgets SET monthly_limit = $1 
+                    WHERE user_id = $2 AND currency = $3
+                """, monthly_limit, user["id"], currency)
             else:
                 await conn.execute("""
-                                   INSERT INTO budgets (user_id, monthly_limit)
-                                   VALUES ($1, $2)
-                                   """, user["id"], monthly_limit)
+                    INSERT INTO budgets (user_id, currency, monthly_limit) 
+                    VALUES ($1, $2, $3)
+                """, user["id"], currency, monthly_limit)
 
 
-async def get_budget(tg_id):
-    """Получает текущий месячный лимит бюджета"""
+async def get_budget(tg_id, currency=None):
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-                                  SELECT b.monthly_limit
-                                  FROM budgets b
-                                           JOIN users u ON u.id = b.user_id
-                                  WHERE u.telegram_id = $1
-                                  """, tg_id)
-        return row["monthly_limit"] if row else None
+        if currency:
+            row = await conn.fetchrow("""
+                                      SELECT b.monthly_limit
+                                      FROM budgets b
+                                               JOIN users u ON u.id = b.user_id
+                                      WHERE u.telegram_id = $1
+                                        AND b.currency = $2
+                                      """, tg_id, currency)
+            return row["monthly_limit"] if row else None
+        else:
+            rows = await conn.fetch("""
+                                    SELECT b.currency, b.monthly_limit
+                                    FROM budgets b
+                                             JOIN users u ON u.id = b.user_id
+                                    WHERE u.telegram_id = $1
+                                    """, tg_id)
+            return {row["currency"]: float(row["monthly_limit"]) for row in rows}
 
 
-async def check_budget_status(tg_id):
-    """Проверяет статус бюджета: траты, лимит, остаток"""
-    budget = await get_budget(tg_id)
+async def check_budget_status(tg_id, currency):
+    budget = await get_budget(tg_id, currency)
     if not budget:
         return None
 
-    spending = await get_monthly_spending(tg_id)
+    spending = await get_monthly_spending(tg_id, currency)
 
-    total_spent = {}
+    total_spent = 0
     for row in spending:
-        total_spent[row["currency"]] = float(row["total"])
+        total_spent += float(row["total"])
 
     return {
+        "currency": currency,
         "limit": float(budget),
         "spent": total_spent,
-        "remaining": float(budget) - sum(total_spent.values())
+        "remaining": float(budget) - total_spent
     }
 
 
-# ================= НОВЫЕ ФУНКЦИИ ДЛЯ NOTIFICATIONS =================
+# ================= NOTIFICATIONS =================
 
 async def add_notification(tg_id, subscription_id, notify_date, notify_type):
-    """Добавляет запись об уведомлении"""
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -374,7 +363,6 @@ async def add_notification(tg_id, subscription_id, notify_date, notify_type):
 
 
 async def mark_notification_sent(tg_id, subscription_id, notify_date):
-    """Отмечает уведомление как отправленное"""
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -390,25 +378,9 @@ async def mark_notification_sent(tg_id, subscription_id, notify_date):
                                """, user["id"], subscription_id, notify_date)
 
 
-async def get_pending_notifications(tg_id):
-    """Получает неотправленные уведомления на сегодня"""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-                                SELECT n.*, s.name, s.amount, s.currency
-                                FROM notifications n
-                                         JOIN users u ON u.id = n.user_id
-                                         JOIN subscriptions s ON s.id = n.subscription_id
-                                WHERE u.telegram_id = $1
-                                  AND n.notify_date <= CURRENT_DATE
-                                  AND n.is_sent = FALSE
-                                """, tg_id)
-        return rows
-
-
 # ================= UI =================
 
 def main_kb():
-    """Главная клавиатура (версия 2.0)"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Добавить")],
@@ -434,7 +406,21 @@ def currency_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="₽ RUB", callback_data="cur_RUB"),
-                InlineKeyboardButton(text="$ USD", callback_data="cur_USD")
+                InlineKeyboardButton(text="$ USD", callback_data="cur_USD"),
+                InlineKeyboardButton(text="€ EUR", callback_data="cur_EUR")
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+        ]
+    )
+
+
+def budget_currency_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="₽ RUB", callback_data="budget_cur_RUB"),
+                InlineKeyboardButton(text="$ USD", callback_data="budget_cur_USD"),
+                InlineKeyboardButton(text="€ EUR", callback_data="budget_cur_EUR")
             ],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ]
@@ -444,12 +430,23 @@ def currency_kb():
 def action_kb(sub_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="➕ Продлить", callback_data=f"renew_{sub_id}"),
-            InlineKeyboardButton(text="❌ Удалить", callback_data=f"del_{sub_id}")
+            InlineKeyboardButton(text="✅ Продлить", callback_data=f"renew_{sub_id}"),
+            InlineKeyboardButton(text="❌ Завершить", callback_data=f"skip_{sub_id}")
         ],
         [
-            InlineKeyboardButton(text="➡️ Не продлевать", callback_data=f"skip_{sub_id}")
+            InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_{sub_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{sub_id}")
         ]
+    ])
+
+
+def edit_fields_kb(sub_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Название", callback_data=f"editfield_{sub_id}_name")],
+        [InlineKeyboardButton(text="💰 Сумма", callback_data=f"editfield_{sub_id}_amount")],
+        [InlineKeyboardButton(text="💱 Валюта", callback_data=f"editfield_{sub_id}_currency")],
+        [InlineKeyboardButton(text="📅 Период (дней)", callback_data=f"editfield_{sub_id}_period")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"back_to_sub_{sub_id}")]
     ])
 
 
@@ -457,11 +454,12 @@ def budget_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Установить лимит", callback_data="set_budget")],
         [InlineKeyboardButton(text="📊 Проверить статус", callback_data="check_budget")],
+        [InlineKeyboardButton(text="📋 Все лимиты", callback_data="list_budgets")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
     ])
 
 
-# ================= ОБРАБОТЧИК ОТМЕНЫ ДЛЯ INLINE КНОПОК =================
+# ================= ОТМЕНА =================
 
 @dp.callback_query(lambda c: c.data == "cancel_action")
 async def cancel_inline(c: types.CallbackQuery, state: FSMContext):
@@ -470,14 +468,13 @@ async def cancel_inline(c: types.CallbackQuery, state: FSMContext):
     await c.message.answer("❌ Действие отменено", reply_markup=main_kb())
     await c.answer()
 
+
 # ================= START =================
 
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
     await add_user(message.from_user.id, message.from_user.username)
-
-    # Принудительно обновляем клавиатуру
     await force_update_keyboard(message.from_user.id)
 
     welcome_text = (
@@ -488,8 +485,9 @@ async def start(message: types.Message, state: FSMContext):
         f"• Добавление подписок\n"
         f"• Напоминания об оплате\n"
         f"• Статистика расходов\n"
-        f"• Установка бюджета\n"
-        f"• История платежей\n\n"
+        f"• Установка бюджета по валютам\n"
+        f"• История платежей\n"
+        f"• Редактирование подписок\n\n"
         f"👇 Выбери действие в меню:"
     )
 
@@ -504,7 +502,6 @@ async def show_menu(message: types.Message, state: FSMContext):
 
 @dp.message(Command("update"))
 async def force_update(message: types.Message):
-    """Принудительное обновление клавиатуры"""
     await force_update_keyboard(message.from_user.id)
     await message.answer("✅ Клавиатура обновлена!", reply_markup=main_kb())
 
@@ -554,12 +551,18 @@ async def amount(message: types.Message, state: FSMContext):
     try:
         amount = float(text)
 
+        if '.' in text:
+            decimal_places = len(text.split('.')[1])
+            if decimal_places > 2:
+                await message.answer("❗ Максимум 2 знака после запятой\nПример: 199.99 или 100")
+                return
+
         if amount <= 0:
             await message.answer("❗ Сумма должна быть больше 0")
             return
 
         if amount > 1_000_000:
-            await message.answer("❗ Слишком большая сумма")
+            await message.answer("❗ Слишком большая сумма (максимум 1 000 000)")
             return
 
         await state.update_data(amount=round(amount, 2))
@@ -567,7 +570,7 @@ async def amount(message: types.Message, state: FSMContext):
 
         await message.answer("💱 Выберите валюту:", reply_markup=currency_kb())
 
-    except:
+    except ValueError:
         await message.answer("❗ Введите корректное число (например: 199.99)")
 
 
@@ -611,14 +614,21 @@ async def date(m: types.Message, state: FSMContext):
     if not d:
         return await m.answer("❌ Неверный формат даты. Используйте YYYY-MM-DD или DD.MM.YYYY")
 
+    today = datetime.now().date()
+    if d < today:
+        return await m.answer(
+            f"❌ Нельзя указать прошедшую дату!\n"
+            f"📅 Сегодня: {today.strftime('%d.%m.%Y')}\n"
+            f"📅 Вы ввели: {d.strftime('%d.%m.%Y')}\n\n"
+            f"Пожалуйста, введите будущую дату:"
+        )
+
     data = await state.get_data()
     data["date"] = d
 
     await add_subscription(m.from_user.id, data)
-
     await state.clear()
 
-    # Формируем сообщение с деталями добавленной подписки
     details = (
         f"✅ Подписка добавлена!\n\n"
         f"📌 Название: {data['name']}\n"
@@ -657,18 +667,132 @@ async def list_subs(m: types.Message):
             f"🔁 Период: {r['period_days']} дней"
         )
 
-        await m.answer(
-            text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="❌ Удалить",
-                    callback_data=f"del_{r['id']}"
-                )]
-            ])
-        )
+        await m.answer(text, reply_markup=action_kb(r['id']))
 
-    # Возвращаем главное меню после списка
     await m.answer("👆 Это все ваши подписки", reply_markup=main_kb())
+
+
+# ================= РЕДАКТИРОВАНИЕ ПОДПИСКИ =================
+
+@dp.callback_query(lambda c: c.data.startswith("edit_"))
+async def edit_subscription(c: types.CallbackQuery, state: FSMContext):
+    sub_id = int(c.data.split("_")[1])
+    await state.update_data(edit_sub_id=sub_id)
+    await c.message.edit_text(
+        "✏️ Выберите поле для редактирования:",
+        reply_markup=edit_fields_kb(sub_id)
+    )
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("back_to_sub_"))
+async def back_to_sub(c: types.CallbackQuery):
+    sub_id = int(c.data.split("_")[3])
+
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow("""
+                                  SELECT name, amount, currency, next_payment_date, period_days
+                                  FROM subscriptions
+                                  WHERE id = $1
+                                  """, sub_id)
+
+    if sub:
+        date = sub["next_payment_date"].strftime("%d.%m.%Y")
+        text = (
+            f"📌 {sub['name']}\n"
+            f"💰 {sub['amount']} {sub['currency']}\n"
+            f"📅 Следующий платёж: {date}\n"
+            f"🔁 Период: {sub['period_days']} дней"
+        )
+        await c.message.edit_text(text, reply_markup=action_kb(sub_id))
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("editfield_"))
+async def edit_field(c: types.CallbackQuery, state: FSMContext):
+    parts = c.data.split("_")
+    sub_id = int(parts[1])
+    field = parts[2]
+
+    await state.update_data(edit_sub_id=sub_id, edit_field=field)
+    await state.set_state(EditSub.new_value)
+
+    field_names = {
+        "name": "название",
+        "amount": "сумму",
+        "currency": "валюту (RUB/USD/EUR)",
+        "period": "период в днях"
+    }
+
+    await c.message.delete()
+    await c.message.answer(
+        f"✏️ Введите новое {field_names[field]}:",
+        reply_markup=cancel_kb()
+    )
+    await c.answer()
+
+
+@dp.message(EditSub.new_value)
+async def save_edited_field(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        return await message.answer("❌ Редактирование отменено", reply_markup=main_kb())
+
+    data = await state.get_data()
+    sub_id = data["edit_sub_id"]
+    field = data["edit_field"]
+    new_value = message.text
+
+    async with pool.acquire() as conn:
+        if field == "name":
+            if len(new_value) > 100:
+                return await message.answer("❗ Название слишком длинное")
+            await conn.execute("UPDATE subscriptions SET name = $1 WHERE id = $2", new_value, sub_id)
+
+        elif field == "amount":
+            try:
+                amount = float(new_value.replace(",", "."))
+                if amount <= 0 or amount > 1_000_000:
+                    return await message.answer("❗ Некорректная сумма")
+                await conn.execute("UPDATE subscriptions SET amount = $1 WHERE id = $2", round(amount, 2), sub_id)
+            except:
+                return await message.answer("❗ Введите корректное число")
+
+        elif field == "currency":
+            new_value = new_value.upper()
+            if new_value not in ["RUB", "USD", "EUR"]:
+                return await message.answer("❗ Валюта должна быть RUB, USD или EUR")
+            await conn.execute("UPDATE subscriptions SET currency = $1 WHERE id = $2", new_value, sub_id)
+
+        elif field == "period":
+            try:
+                days = int(new_value)
+                if days <= 0 or days > 365:
+                    return await message.answer("❗ Период должен быть от 1 до 365 дней")
+                await conn.execute("UPDATE subscriptions SET period_days = $1 WHERE id = $2", days, sub_id)
+            except:
+                return await message.answer("❗ Введите целое число дней")
+
+    await state.clear()
+
+    # Показываем обновлённую подписку
+    async with pool.acquire() as conn:
+        sub = await conn.fetchrow("""
+                                  SELECT name, amount, currency, next_payment_date, period_days
+                                  FROM subscriptions
+                                  WHERE id = $1
+                                  """, sub_id)
+
+    date = sub["next_payment_date"].strftime("%d.%m.%Y")
+    text = (
+        f"✅ Подписка обновлена!\n\n"
+        f"📌 {sub['name']}\n"
+        f"💰 {sub['amount']} {sub['currency']}\n"
+        f"📅 Следующий платёж: {date}\n"
+        f"🔁 Период: {sub['period_days']} дней"
+    )
+
+    await message.answer(text, reply_markup=main_kb())
 
 
 # ================= STATS =================
@@ -693,8 +817,6 @@ async def stats(message: types.Message, state: FSMContext):
 
     text = "📊 Ваши подписки:\n\n"
     by_currency = {}
-    total_monthly = {}
-    total_yearly = {}
 
     for r in rows:
         cur = r["currency"]
@@ -707,7 +829,6 @@ async def stats(message: types.Message, state: FSMContext):
             f"• {r['name']} — {r['amount']} {cur} (каждые {r['period_days']} дн.)"
         )
 
-        # Расчёт месячных и годовых трат
         monthly_cost = (r["amount"] * 30) / r["period_days"]
         yearly_cost = (r["amount"] * 365) / r["period_days"]
 
@@ -725,33 +846,48 @@ async def stats(message: types.Message, state: FSMContext):
     await message.answer(text, reply_markup=main_kb())
 
 
-# ================= БЮДЖЕТ =================
+# ================= БЮДЖЕТ (ИСПРАВЛЕННЫЙ) =================
 
 @dp.message(lambda m: m.text == "💰 Бюджет")
 async def budget_menu(message: types.Message):
-    budget = await get_budget(message.from_user.id)
+    budgets = await get_budget(message.from_user.id)
 
-    if budget:
-        status = await check_budget_status(message.from_user.id)
-        spent = sum(status["spent"].values()) if status["spent"] else 0
-
-        text = (
-            f"💰 Текущий бюджет:\n"
-            f"📊 Лимит: {budget:,.2f} ₽\n"
-            f"💸 Потрачено: {spent:,.2f} ₽\n"
-            f"✨ Осталось: {status['remaining']:,.2f} ₽"
-        ).replace(",", " ")
+    if budgets:
+        text = "💰 Ваши лимиты:\n\n"
+        for currency, limit in budgets.items():
+            status = await check_budget_status(message.from_user.id, currency)
+            spent = status["spent"] if status else 0
+            remaining = status["remaining"] if status else limit
+            text += (
+                f"💱 {currency}:\n"
+                f"   📊 Лимит: {limit:,.2f}\n"
+                f"   💸 Потрачено: {spent:,.2f}\n"
+                f"   ✨ Осталось: {remaining:,.2f}\n\n"
+            ).replace(",", " ")
     else:
-        text = "💰 Бюджет не установлен"
+        text = "💰 Бюджеты не установлены"
 
     await message.answer(text, reply_markup=budget_kb())
 
 
 @dp.callback_query(lambda c: c.data == "set_budget")
 async def set_budget_start(c: types.CallbackQuery, state: FSMContext):
+    await state.set_state(SetBudget.currency)
+    await c.message.delete()
+    await c.message.answer("💱 Выберите валюту для лимита:", reply_markup=budget_currency_kb())
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("budget_cur_"))
+async def budget_currency_selected(c: types.CallbackQuery, state: FSMContext):
+    currency = c.data.split("_")[2]
+    await state.update_data(budget_currency=currency)
     await state.set_state(SetBudget.monthly_limit)
     await c.message.delete()
-    await c.message.answer("💰 Введите месячный лимит бюджета (в рублях):", reply_markup=cancel_kb())
+    await c.message.answer(
+        f"💰 Введите месячный лимит бюджета в {currency}:",
+        reply_markup=cancel_kb()
+    )
     await c.answer()
 
 
@@ -771,24 +907,53 @@ async def set_budget_finish(message: types.Message, state: FSMContext):
             await message.answer("❗ Слишком большой лимит")
             return
 
-        await set_budget(message.from_user.id, limit)
+        data = await state.get_data()
+        currency = data["budget_currency"]
+
+        await set_budget(message.from_user.id, currency, limit)
         await state.clear()
-        await message.answer(f"✅ Месячный лимит установлен: {limit:,.2f} ₽".replace(",", " "), reply_markup=main_kb())
+        await message.answer(
+            f"✅ Месячный лимит установлен: {limit:,.2f} {currency}".replace(",", " "),
+            reply_markup=main_kb()
+        )
     except:
         await message.answer("❗ Введите корректное число")
 
 
 @dp.callback_query(lambda c: c.data == "check_budget")
-async def check_budget_status_handler(c: types.CallbackQuery):
-    status = await check_budget_status(c.from_user.id)
+async def check_budget_status_start(c: types.CallbackQuery):
+    budgets = await get_budget(c.from_user.id)
 
-    if not status:
-        await c.message.answer("❌ Бюджет не установлен")
+    if not budgets:
+        await c.message.answer("❌ Бюджеты не установлены")
         await c.answer()
         return
 
-    spent = sum(status["spent"].values()) if status["spent"] else 0
-    percent = (spent / status["limit"] * 100) if status["limit"] > 0 else 0
+    # Создаём клавиатуру с валютами
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+                                                  [InlineKeyboardButton(text=f"💱 {cur}",
+                                                                        callback_data=f"checkbudget_{cur}")]
+                                                  for cur in budgets.keys()
+                                              ] + [[InlineKeyboardButton(text="❌ Отмена",
+                                                                         callback_data="cancel_action")]])
+
+    await c.message.edit_text("💱 Выберите валюту для проверки:", reply_markup=kb)
+    await c.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("checkbudget_"))
+async def check_budget_status_handler(c: types.CallbackQuery):
+    currency = c.data.split("_")[1]
+    status = await check_budget_status(c.from_user.id, currency)
+
+    if not status:
+        await c.message.edit_text(f"❌ Бюджет для {currency} не установлен")
+        await c.answer()
+        return
+
+    spent = status["spent"]
+    limit = status["limit"]
+    percent = (spent / limit * 100) if limit > 0 else 0
 
     if percent >= 100:
         warning = "🔴 Внимание! Бюджет превышен!"
@@ -803,30 +968,82 @@ async def check_budget_status_handler(c: types.CallbackQuery):
         warning = "✅ В пределах бюджета"
         emoji = "🟢"
 
-    # Создаём прогресс-бар
     bar_length = 10
-    filled = int(percent / 10)
+    filled = min(int(percent / 10), 10)
     bar = "█" * filled + "░" * (bar_length - filled)
 
     text = (
-        f"{emoji} Статус бюджета:\n\n"
-        f"💰 Лимит: {status['limit']:,.2f} ₽\n"
-        f"💸 Потрачено: {spent:,.2f} ₽\n"
-        f"✨ Осталось: {status['remaining']:,.2f} ₽\n\n"
+        f"{emoji} Статус бюджета ({currency}):\n\n"
+        f"💰 Лимит: {limit:,.2f} {currency}\n"
+        f"💸 Потрачено: {spent:,.2f} {currency}\n"
+        f"✨ Осталось: {status['remaining']:,.2f} {currency}\n\n"
         f"📊 Использовано: {percent:.1f}%\n"
         f"[{bar}]\n\n"
         f"{warning}"
     ).replace(",", " ")
 
-    await c.message.answer(text)
+    await c.message.edit_text(text)
     await c.answer()
 
+@dp.callback_query(lambda c: c.data == "list_budgets")
+async def list_budgets(c: types.CallbackQuery):
+    budgets = await get_budget(c.from_user.id)
 
-# ================= ИСТОРИЯ ПЛАТЕЖЕЙ =================
+    if not budgets:
+        await c.message.edit_text("❌ Бюджеты не установлены")
+        await c.answer()
+        return
+
+    text = "📋 Все установленные лимиты:\n\n"
+    for currency, limit in budgets.items():
+        status = await check_budget_status(c.from_user.id, currency)
+        spent = status["spent"] if status else 0
+        remaining = status["remaining"] if status else limit
+        percent = (spent / limit * 100) if limit > 0 else 0
+
+        text += (
+                f"💱 {currency}:\n"
+                f"   📊 Лимит: {limit:,.2f}\n"
+                f"   💸 Потрачено: {spent:,.2f}\n"
+                f"   ✨ Осталось: {remaining:,.2f}\n"
+                f"   📈 Использовано: {percent:.1f}%\n\n"
+        ).replace(",", " ")
+
+        # Добавляем кнопку назад
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_budget")]
+    ])
+
+    await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
+
+@dp.callback_query(lambda c: c.data == "back_to_budget")
+async def back_to_budget(c: types.CallbackQuery):
+    budgets = await get_budget(c.from_user.id)
+
+    if budgets:
+        text = "💰 Ваши лимиты:\n\n"
+        for currency, limit in budgets.items():
+            status = await check_budget_status(c.from_user.id, currency)
+            spent = status["spent"] if status else 0
+            remaining = status["remaining"] if status else limit
+            text += (
+                    f"💱 {currency}:\n"
+                    f"   📊 Лимит: {limit:,.2f}\n"
+                    f"   💸 Потрачено: {spent:,.2f}\n"
+                    f"   ✨ Осталось: {remaining:,.2f}\n\n"
+            ).replace(",", " ")
+    else:
+        text = "💰 Бюджеты не установлены"
+
+    await c.message.edit_text(text, reply_markup=budget_kb())
+    await c.answer()
+
+    # ================= ИСТОРИЯ ПЛАТЕЖЕЙ (ИСПРАВЛЕННАЯ) =================
 
 @dp.message(lambda m: m.text == "📜 История платежей")
 async def payment_history(message: types.Message):
-    history = await get_payment_history(message.from_user.id, limit=20)
+    history = await get_payment_history(message.from_user.id, limit=30)
 
     if not history:
         await message.answer("📜 История платежей пуста", reply_markup=main_kb())
@@ -834,10 +1051,17 @@ async def payment_history(message: types.Message):
 
     text = "📜 Последние платежи:\n\n"
 
-    for payment in history:
-        date = payment["payment_date"].strftime("%d.%m.%Y")
+    # Используем словарь для отслеживания уникальных платежей
+    seen_payments = set()
 
-        # Эмодзи для статуса
+    for payment in history:
+        # Создаём уникальный ключ для платежа
+        payment_key = f"{payment['subscription_id']}_{payment['payment_date']}_{payment['amount']}"
+
+        if payment_key in seen_payments:
+            continue
+        seen_payments.add(payment_key)
+        date = payment["payment_date"].strftime("%d.%m.%Y")
         status_emoji = {
             "paid": "✅",
             "skipped": "⏭️",
@@ -846,12 +1070,11 @@ async def payment_history(message: types.Message):
         }.get(payment["status"], "❓")
 
         text += (
-            f"{status_emoji} {payment['subscription_name']}\n"
-            f"   💰 {payment['amount']} {payment['currency']}\n"
-            f"   📅 {date}\n\n"
+                f"{status_emoji} {payment['subscription_name']}\n"
+                f"   💰 {payment['amount']} {payment['currency']}\n"
+                f"   📅 {date}\n\n"
         )
 
-    # Если сообщение слишком длинное, разбиваем на части
     if len(text) > 4000:
         parts = [text[i:i + 4000] for i in range(0, len(text), 4000)]
         for part in parts:
@@ -859,29 +1082,28 @@ async def payment_history(message: types.Message):
     else:
         await message.answer(text)
 
-    # Возвращаем главное меню
     await message.answer("👆 Это история ваших платежей", reply_markup=main_kb())
 
-# ================= NOTIFICATIONS (ОБНОВЛЁННАЯ) =================
 
 async def notification_loop():
     while True:
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch("""
-                                        SELECT s.*, u.telegram_id
-                                        FROM subscriptions s
-                                                 JOIN users u ON u.id = s.user_id
-                                        """)
+                    SELECT s.*, u.telegram_id
+                    FROM subscriptions s
+                    JOIN users u ON u.id = s.user_id
+                """)
 
             today = datetime.now().date()
+            print(f"\n🔍 Проверка уведомлений. Сегодня: {today}")
 
             for r in rows:
                 try:
                     delta = (r["next_payment_date"] - today).days
                     pay_date = r["next_payment_date"].strftime("%d.%m.%Y")
 
-                    ideas = "\n".join([f"  • {idea}" for idea in spending_ideas(r["amount"])])
+                    ideas = "\n".join([f"  • {idea}" for idea in spending_ideas(float(r["amount"]))])
 
                     text = (
                         f"📌 {r['name']}\n"
@@ -894,55 +1116,56 @@ async def notification_loop():
                     # ===== 3 дня =====
                     if delta == 3 and not r["reminded_3d"]:
                         await bot.send_message(r["telegram_id"], "⏳ Через 3 дня спишется:\n\n" + text)
-
                         await add_notification(r["telegram_id"], r["id"], today, "reminder_3d")
 
                         async with pool.acquire() as conn2:
                             await conn2.execute("""
-                                                UPDATE subscriptions
-                                                SET reminded_3d = TRUE
-                                                WHERE id = $1
-                                                """, r["id"])
+                                UPDATE subscriptions SET reminded_3d = TRUE WHERE id = $1
+                            """, r["id"])
+                        print(f"✅ 3 дня: {r['name']}")
 
                     # ===== 1 день =====
                     if delta == 1 and not r["reminded_1d"]:
                         await bot.send_message(r["telegram_id"], "⏰ Завтра спишется:\n\n" + text)
-
                         await add_notification(r["telegram_id"], r["id"], today, "reminder_1d")
 
                         async with pool.acquire() as conn2:
                             await conn2.execute("""
-                                                UPDATE subscriptions
-                                                SET reminded_1d = TRUE
-                                                WHERE id = $1
-                                                """, r["id"])
+                                UPDATE subscriptions SET reminded_1d = TRUE WHERE id = $1
+                            """, r["id"])
+                        print(f"✅ 1 день: {r['name']}")
 
-                    # ===== сегодня =====
-                    if delta <= 0:
-                        await bot.send_message(
-                            r["telegram_id"],
-                            "💸 Сегодня списание:\n\n" + text,
-                            reply_markup=action_kb(r["id"])
-                        )
-                        await add_payment_record(
-                            r["telegram_id"],
-                            r["id"],
-                            float(r["amount"]),
-                            today,
-                            "paid"
-                        )
-                        await add_notification(r["telegram_id"], r["id"], today, "payment_due")
+                    # ===== сегодня (только уведомление, без обновления даты) =====
+                    if delta == 0:
+                        reminded_today = r.get("reminded_today", False)
+                        if not reminded_today:
+                            await bot.send_message(
+                                r["telegram_id"],
+                                "💸 Сегодня списание:\n\n" + text,
+                                reply_markup=action_kb(r["id"])
+                            )
 
-                        new_date = next_payment(r["next_payment_date"], r["period_days"])
+                            await add_payment_record(
+                                r["telegram_id"],
+                                r["id"],
+                                float(r["amount"]),
+                                today,
+                                "paid"
+                            )
 
-                        async with pool.acquire() as conn2:
-                            await conn2.execute("""
-                                                UPDATE subscriptions
-                                                SET next_payment_date=$1,
-                                                    reminded_3d= FALSE,
-                                                    reminded_1d= FALSE
-                                                WHERE id = $2
-                                                """, new_date, r["id"])
+                            await add_notification(r["telegram_id"], r["id"], today, "payment_due")
+
+                            # Только отмечаем, что уведомили сегодня, НЕ обновляем дату!
+                            async with pool.acquire() as conn2:
+                                await conn2.execute("""
+                                    UPDATE subscriptions SET reminded_today = TRUE WHERE id = $1
+                                """, r["id"])
+                            print(f"✅ Сегодня (уведомление): {r['name']}")
+
+                    # ===== просрочено =====
+                    if delta < 0:
+                        print(f"⚠️ Просрочено: {r['name']}, дата: {pay_date}")
+
                 except Exception as e:
                     logging.error(f"Error processing subscription {r['id']}: {e}")
                     continue
@@ -952,114 +1175,92 @@ async def notification_loop():
         except Exception as e:
             logging.error(f"Error in notification loop: {e}")
             await asyncio.sleep(60)
-
-
-# ================= ACTIONS =================
-
+    # ================= ACTIONS =================
 
 @dp.callback_query(lambda c: c.data.startswith("del_"))
 async def delete(c: types.CallbackQuery):
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
-        # Получаем название подписки перед удалением
         sub = await conn.fetchrow("SELECT name FROM subscriptions WHERE id=$1", sub_id)
         await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
-
     await c.message.edit_text(f"❌ Подписка \"{sub['name']}\" удалена")
     await c.answer(f"Подписка {sub['name']} удалена")
-
 
 @dp.callback_query(lambda c: c.data.startswith("renew_"))
 async def renew(c: types.CallbackQuery):
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
-        # Получаем данные подписки
         sub = await conn.fetchrow(
-            "SELECT user_id, amount, currency, name FROM subscriptions WHERE id=$1",
+            "SELECT name, amount, currency, period_days, next_payment_date FROM subscriptions WHERE id=$1",
             sub_id
         )
 
-        # Обновляем дату следующего платежа
+        # Вычисляем новую дату
+        new_date = sub["next_payment_date"] + timedelta(days=sub["period_days"])
 
+        # Обновляем дату и сбрасываем ВСЕ флаги уведомлений
         await conn.execute("""
-                           UPDATE subscriptions
-                           SET next_payment_date = next_payment_date + period_days * interval '1 day'
-                           WHERE id=$1
-                           """, sub_id)
+            UPDATE subscriptions
+            SET next_payment_date = $1,
+                reminded_3d = FALSE,
+                reminded_1d = FALSE,
+                reminded_today = FALSE
+            WHERE id = $2
+        """, new_date, sub_id)
 
         # Добавляем запись о платеже
+        await conn.execute("""
+            INSERT INTO payments (subscription_id, amount, payment_date, status, created_at)
+            VALUES ($1, $2, CURRENT_DATE, 'paid', NOW())
+        """, sub_id, float(sub["amount"]))
 
-        if sub:
-            await conn.execute("""
-
-                               INSERT INTO payments (subscription_id, amount, payment_date, status, created_at)
-
-                               VALUES ($1, $2, CURRENT_DATE, 'paid', NOW())
-
-                               """, sub_id, float(sub["amount"]))
-    await c.message.edit_text(f"🔁 Подписка \"{sub['name']}\" продлена")
+    await c.message.edit_text(
+        f"🔁 Подписка \"{sub['name']}\" продлена!\n"
+        f"📅 Следующее списание: {new_date.strftime('%d.%m.%Y')}"
+    )
     await c.answer("Подписка продлена")
-
 
 @dp.callback_query(lambda c: c.data.startswith("skip_"))
 async def skip(c: types.CallbackQuery):
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
-        # Получаем данные подписки перед удалением
-
         sub = await conn.fetchrow(
-            "SELECT user_id, amount, currency, name FROM subscriptions WHERE id=$1",
+            "SELECT name, amount, currency FROM subscriptions WHERE id=$1",
             sub_id
         )
 
-        # Добавляем запись о пропущенном платеже
-
         if sub:
+            # Добавляем запись о пропущенном платеже
             await conn.execute("""
+                INSERT INTO payments (subscription_id, amount, payment_date, status, created_at)
+                VALUES ($1, $2, CURRENT_DATE, 'skipped', NOW())
+            """, sub_id, float(sub["amount"]))
 
-                               INSERT INTO payments (subscription_id, amount, payment_date, status, created_at)
-
-                               VALUES ($1, $2, CURRENT_DATE, 'skipped', NOW())
-
-                               """, sub_id, float(sub["amount"]))
         # Удаляем подписку
         await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
+
     await c.message.edit_text(f"⏭️ Подписка \"{sub['name']}\" завершена")
     await c.answer("Подписка завершена")
-
-
 # ================= ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД =================
-
-
 @dp.message()
 async def unknown_message(message: types.Message):
-    """Обработчик неизвестных сообщений"""
     await message.answer(
         "❓ Неизвестная команда. Используйте кнопки меню или /start",
         reply_markup=main_kb()
-
     )
-
-
 # ================= MAIN =================
-
-
 async def main():
     await init_db()
-
     asyncio.create_task(notification_loop())
-
     print("✅ Бот запущен!")
     print(f"📱 Версия клавиатуры: {KEYBOARD_VERSION}")
     try:
         await dp.start_polling(bot)
     finally:
         await pool.close()
-
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
