@@ -276,7 +276,7 @@ async def stats(m: types.Message):
     await m.answer(text or "Нет данных")
 
 
-# ================= NOTIFICATIONS =================
+# ================= NOTIFICATIONS (FIXED) =================
 
 async def notification_loop():
     while True:
@@ -307,21 +307,23 @@ async def notification_loop():
             if delta == 3 and not r["reminded_3d"]:
                 await bot.send_message(r["telegram_id"], "⏳ Через 3 дня\n\n" + text)
 
-                await conn.execute("""
-                    UPDATE subscriptions
-                    SET reminded_3d = TRUE
-                    WHERE id=$1
-                """, r["id"])
+                async with pool.acquire() as conn2:
+                    await conn2.execute("""
+                        UPDATE subscriptions
+                        SET reminded_3d = TRUE
+                        WHERE id=$1
+                    """, r["id"])
 
             # ===== 1 день (1 раз) =====
             if delta == 1 and not r["reminded_1d"]:
                 await bot.send_message(r["telegram_id"], "⏰ Завтра\n\n" + text)
 
-                await conn.execute("""
-                    UPDATE subscriptions
-                    SET reminded_1d = TRUE
-                    WHERE id=$1
-                """, r["id"])
+                async with pool.acquire() as conn2:
+                    await conn2.execute("""
+                        UPDATE subscriptions
+                        SET reminded_1d = TRUE
+                        WHERE id=$1
+                    """, r["id"])
 
             # ===== сегодня =====
             if delta <= 0:
@@ -333,13 +335,14 @@ async def notification_loop():
 
                 new_date = next_payment(r["next_payment_date"], r["period_days"])
 
-                await conn.execute("""
-                    UPDATE subscriptions
-                    SET next_payment_date=$1,
-                        reminded_3d=FALSE,
-                        reminded_1d=FALSE
-                    WHERE id=$2
-                """, new_date, r["id"])
+                async with pool.acquire() as conn2:
+                    await conn2.execute("""
+                        UPDATE subscriptions
+                        SET next_payment_date=$1,
+                            reminded_3d=FALSE,
+                            reminded_1d=FALSE
+                        WHERE id=$2
+                    """, new_date, r["id"])
 
         await asyncio.sleep(60)
 
