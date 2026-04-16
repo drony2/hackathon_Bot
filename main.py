@@ -64,20 +64,20 @@ def next_month(date):
 # ================= ИДЕИ РАСХОДОВ =================
 
 def spending_ideas(amount):
-    if amount < 300:
+    if amount <= 300:
         return [
             "☕ 1 кофе в кафе",
             "🍫 небольшой перекус",
             "📱 часть мобильной подписки"
         ]
-    elif amount < 1000:
+    elif amount <= 1000:
         return [
             "☕ 3–5 кофе",
             "🍔 1–2 доставки еды",
             "🎬 1 кино",
             "🎧 Spotify / YouTube Premium"
         ]
-    elif amount < 3000:
+    elif amount <= 3000:
         return [
             "🍕 несколько доставок еды",
             "🎮 игровая подписка",
@@ -187,14 +187,34 @@ async def get_name(message: types.Message, state: FSMContext):
     await message.answer("Введите сумму")
 
 
+# ================= ВАЛИДАЦИЯ СУММЫ =================
+
 @dp.message(AddSub.amount)
 async def get_amount(message: types.Message, state: FSMContext):
+    text = message.text.replace(",", ".")
+
     try:
-        await state.update_data(amount=float(message.text))
+        amount = float(text)
+
+        if amount <= 0:
+            await message.answer("❗ Сумма должна быть больше 0")
+            return
+
+        if amount > 1_000_000:
+            await message.answer("❗ Слишком большая сумма")
+            return
+
+        if float(text) == 0:
+            await message.answer("❗ Некорректная сумма")
+            return
+
+        await state.update_data(amount=round(amount, 2))
         await state.set_state(AddSub.currency)
+
         await message.answer("Выберите валюту:", reply_markup=currency_kb())
+
     except:
-        await message.answer("❗ Введите число")
+        await message.answer("❗ Введите корректное число (например: 199.99)")
 
 
 @dp.callback_query(lambda c: c.data.startswith("cur_"))
@@ -247,6 +267,8 @@ async def list_subs(message: types.Message, state: FSMContext):
         return
 
     for r in rows:
+        formatted_date = r["next_payment_date"].strftime("%d.%m.%Y")
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="❌ Удалить подписку",
@@ -255,7 +277,7 @@ async def list_subs(message: types.Message, state: FSMContext):
         ])
 
         await message.answer(
-            f"📌 {r['name']} — {r['amount']} {r['currency']} ({r['next_payment_date']})",
+            f"📌 {r['name']} — {r['amount']} {r['currency']} ({formatted_date})",
             reply_markup=kb
         )
 
@@ -295,12 +317,23 @@ async def stats(message: types.Message, state: FSMContext):
         return
 
     text = "📊 Расходы по подпискам:\n\n"
+    by_currency = {}
 
     for r in rows:
-        text += f"• {r['name']} — {r['amount']} {r['currency']}\n"
+        cur = r["currency"]
 
-    total = sum(r["amount"] for r in rows)
-    text += f"\n💸 Итого: {round(total, 2)}"
+        if cur not in by_currency:
+            by_currency[cur] = {"total": 0, "items": []}
+
+        by_currency[cur]["total"] += r["amount"]
+        by_currency[cur]["items"].append(
+            f"• {r['name']} — {r['amount']} {cur}"
+        )
+
+    for cur, data in by_currency.items():
+        text += f"\n💰 {cur}:\n"
+        text += "\n".join(data["items"])
+        text += f"\n💸 Итого: {round(data['total'], 2)} {cur}\n"
 
     await message.answer(text)
 
@@ -326,7 +359,7 @@ async def notification_loop():
                     delta_days = (r["next_payment_date"] - today).days
 
                     ideas = spending_ideas(r["amount"])
-                    ideas_text = "\n💡 На это можно потратить:\n"
+                    ideas_text = "\n💡 На эту сумму можно:\n"
                     for i in ideas:
                         ideas_text += f"• {i}\n"
 
