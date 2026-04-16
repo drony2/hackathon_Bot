@@ -862,7 +862,6 @@ async def payment_history(message: types.Message):
     # Возвращаем главное меню
     await message.answer("👆 Это история ваших платежей", reply_markup=main_kb())
 
-
 # ================= NOTIFICATIONS (ОБНОВЛЁННАЯ) =================
 
 async def notification_loop():
@@ -925,7 +924,6 @@ async def notification_loop():
                             "💸 Сегодня списание:\n\n" + text,
                             reply_markup=action_kb(r["id"])
                         )
-
                         await add_payment_record(
                             r["telegram_id"],
                             r["id"],
@@ -933,7 +931,6 @@ async def notification_loop():
                             today,
                             "paid"
                         )
-
                         await add_notification(r["telegram_id"], r["id"], today, "payment_due")
 
                         new_date = next_payment(r["next_payment_date"], r["period_days"])
@@ -946,18 +943,14 @@ async def notification_loop():
                                                     reminded_1d= FALSE
                                                 WHERE id = $2
                                                 """, new_date, r["id"])
-
                 except Exception as e:
                     logging.error(f"Error processing subscription {r['id']}: {e}")
                     continue
 
             await asyncio.sleep(60)
 
-
         except Exception as e:
-
             logging.error(f"Error in notification loop: {e}")
-
             await asyncio.sleep(60)
 
 
@@ -970,13 +963,10 @@ async def delete(c: types.CallbackQuery):
 
     async with pool.acquire() as conn:
         # Получаем название подписки перед удалением
-
         sub = await conn.fetchrow("SELECT name FROM subscriptions WHERE id=$1", sub_id)
-
         await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
 
     await c.message.edit_text(f"❌ Подписка \"{sub['name']}\" удалена")
-
     await c.answer(f"Подписка {sub['name']} удалена")
 
 
@@ -986,25 +976,17 @@ async def renew(c: types.CallbackQuery):
 
     async with pool.acquire() as conn:
         # Получаем данные подписки
-
         sub = await conn.fetchrow(
-
             "SELECT user_id, amount, currency, name FROM subscriptions WHERE id=$1",
-
             sub_id
-
         )
 
         # Обновляем дату следующего платежа
 
         await conn.execute("""
-
                            UPDATE subscriptions
-
                            SET next_payment_date = next_payment_date + period_days * interval '1 day'
-
                            WHERE id=$1
-
                            """, sub_id)
 
         # Добавляем запись о платеже
@@ -1017,9 +999,7 @@ async def renew(c: types.CallbackQuery):
                                VALUES ($1, $2, CURRENT_DATE, 'paid', NOW())
 
                                """, sub_id, float(sub["amount"]))
-
     await c.message.edit_text(f"🔁 Подписка \"{sub['name']}\" продлена")
-
     await c.answer("Подписка продлена")
 
 
@@ -1031,11 +1011,8 @@ async def skip(c: types.CallbackQuery):
         # Получаем данные подписки перед удалением
 
         sub = await conn.fetchrow(
-
             "SELECT user_id, amount, currency, name FROM subscriptions WHERE id=$1",
-
             sub_id
-
         )
 
         # Добавляем запись о пропущенном платеже
@@ -1048,13 +1025,9 @@ async def skip(c: types.CallbackQuery):
                                VALUES ($1, $2, CURRENT_DATE, 'skipped', NOW())
 
                                """, sub_id, float(sub["amount"]))
-
         # Удаляем подписку
-
         await conn.execute("DELETE FROM subscriptions WHERE id=$1", sub_id)
-
     await c.message.edit_text(f"⏭️ Подписка \"{sub['name']}\" завершена")
-
     await c.answer("Подписка завершена")
 
 
@@ -1064,11 +1037,8 @@ async def skip(c: types.CallbackQuery):
 @dp.message()
 async def unknown_message(message: types.Message):
     """Обработчик неизвестных сообщений"""
-
     await message.answer(
-
         "❓ Неизвестная команда. Используйте кнопки меню или /start",
-
         reply_markup=main_kb()
 
     )
@@ -1083,28 +1053,17 @@ async def main():
     asyncio.create_task(notification_loop())
 
     print("✅ Бот запущен!")
-
     print(f"📱 Версия клавиатуры: {KEYBOARD_VERSION}")
-
     try:
-
         await dp.start_polling(bot)
-
     finally:
-
         await pool.close()
 
 
 if __name__ == "__main__":
-
     try:
-
         asyncio.run(main())
-
     except KeyboardInterrupt:
-
         print("👋 Бот остановлен")
-
     except Exception as e:
-
         print(f"❌ Ошибка: {e}")
