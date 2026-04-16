@@ -193,7 +193,7 @@ async def get_date(message: types.Message, state: FSMContext):
     await message.answer("✅ Добавлено", reply_markup=main_kb())
 
 
-# ================= LIST =================
+# ================= LIST + DELETE =================
 
 @dp.message(lambda m: m.text == "📋 Список")
 async def list_subs(message: types.Message, state: FSMContext):
@@ -203,7 +203,7 @@ async def list_subs(message: types.Message, state: FSMContext):
 
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT name, amount, currency, next_payment_date
+            SELECT s.id, s.name, s.amount, s.currency, s.next_payment_date
             FROM subscriptions s
             JOIN users u ON u.id = s.user_id
             WHERE u.telegram_id=$1
@@ -214,15 +214,35 @@ async def list_subs(message: types.Message, state: FSMContext):
         await message.answer("❌ Нет подписок")
         return
 
-    text = "📋 Подписки:\n\n"
-
     for r in rows:
-        text += f"{r['name']} — {r['amount']} {r['currency']} ({r['next_payment_date']})\n"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Удалить",
+                callback_data=f"del_{r['id']}"
+            )]
+        ])
 
-    await message.answer(text)
+        await message.answer(
+            f"📌 {r['name']} — {r['amount']} {r['currency']} ({r['next_payment_date']})",
+            reply_markup=kb
+        )
 
 
-# ================= STATS =================
+@dp.callback_query(lambda c: c.data.startswith("del_"))
+async def delete_subscription(callback: types.CallbackQuery):
+    sub_id = int(callback.data.split("_")[1])
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            DELETE FROM subscriptions
+            WHERE id = $1
+        """, sub_id)
+
+    await callback.message.edit_text("🗑 Подписка удалена")
+    await callback.answer("Удалено")
+
+
+# ================= STATS (РАСШИРЕННАЯ) =================
 
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def stats(message: types.Message, state: FSMContext):
@@ -232,21 +252,35 @@ async def stats(message: types.Message, state: FSMContext):
 
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT amount FROM subscriptions s
+            SELECT name, amount, currency
+            FROM subscriptions s
             JOIN users u ON u.id = s.user_id
             WHERE u.telegram_id=$1
         """, message.from_user.id)
 
-    total = sum(r["amount"] for r in rows)
+    if not rows:
+        await message.answer("❌ Нет подписок")
+        return
 
-    await message.answer(f"💸 В месяц: {round(total,2)}")
+    text = "📊 Расходы по подпискам:\n\n"
+
+    by_currency = {}
+
+    for r in rows:
+        text += f"• {r['name']} — {r['amount']} {r['currency']}\n"
+
+        cur = r["currency"]
+        by_currency[cur] = by_currency.get(cur, 0) + r["amount"]
+
+    text += "\n💸 Итого:\n"
+
+    for cur, amount in by_currency.items():
+        text += f"• {round(amount, 2)} {cur}\n"
+
+    await message.answer(text)
 
 
 # ================= NOTIFICATIONS =================
-
-def days_diff(date):
-    return (date - datetime.now().date()).days
-
 
 async def notification_loop():
     while True:
@@ -266,7 +300,6 @@ async def notification_loop():
                 for r in rows:
                     delta_days = (r["next_payment_date"] - today).days
 
-                    # ===== 3 ДНЯ =====
                     if delta_days == 3 and not r["reminded_3d"]:
                         await bot.send_message(
                             r["telegram_id"],
@@ -279,7 +312,6 @@ async def notification_loop():
                             WHERE id = $1
                         """, r["id"])
 
-                    # ===== 1 ДЕНЬ =====
                     if delta_days == 1 and not r["reminded_1d"]:
                         await bot.send_message(
                             r["telegram_id"],
@@ -292,7 +324,6 @@ async def notification_loop():
                             WHERE id = $1
                         """, r["id"])
 
-                    # ===== СЕГОДНЯ / ПРОСРОЧЕНО =====
                     if delta_days <= 0:
                         await bot.send_message(
                             r["telegram_id"],
