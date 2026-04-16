@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
-from dbCon import DB_CONFIG
+from DB.dbCon import DB_CONFIG
 
 # ================= CONFIG =================
 
