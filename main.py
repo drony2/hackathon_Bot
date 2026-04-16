@@ -182,14 +182,31 @@ async def name(m: types.Message, state: FSMContext):
 
 
 @dp.message(AddSub.amount)
-async def amount(m: types.Message, state: FSMContext):
+async def amount(message: types.Message, state: FSMContext):
+    text = message.text.replace(",", ".")
+
     try:
-        val = float(m.text)
-        await state.update_data(amount=val)
+        amount = float(text)
+
+        if amount <= 0:
+            await message.answer("❗ Сумма должна быть больше 0")
+            return
+
+        if amount > 1_000_000:
+            await message.answer("❗ Слишком большая сумма")
+            return
+
+        if float(text) == 0:
+            await message.answer("❗ Некорректная сумма")
+            return
+
+        await state.update_data(amount=round(amount, 2))
         await state.set_state(AddSub.currency)
-        await m.answer("Валюта:", reply_markup=currency_kb())
+
+        await message.answer("Выберите валюту:", reply_markup=currency_kb())
+
     except:
-        await m.answer("Ошибка числа")
+        await message.answer("❗ Введите корректное число (например: 199.99)")
 
 
 @dp.callback_query(lambda c: c.data.startswith("cur_"))
