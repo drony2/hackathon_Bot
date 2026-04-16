@@ -6,11 +6,15 @@ from datetime import datetime, timedelta
 import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
 
 from dbCon import DB_CONFIG
-
 
 # ================= CONFIG =================
 
@@ -32,21 +36,33 @@ async def init_db():
     pool = await asyncpg.create_pool(**DB_CONFIG)
 
 
-# ================= DATE =================
+# ================= FSM =================
 
-def parse_date(text: str):
-    formats = ["%Y-%m-%d", "%d.%m.%Y", "%d-%m-%Y", "%Y/%m/%d"]
+class AddSub(StatesGroup):
+    name = State()
+    amount = State()
+    currency = State()
+    date = State()
 
+
+# ================= UTILS =================
+
+def parse_date(text):
+    formats = ["%Y-%m-%d", "%d.%m.%Y"]
     for fmt in formats:
         try:
             return datetime.strptime(text, fmt).date()
         except:
             pass
-
     return None
 
 
-# ================= DB FUNCTIONS =================
+def next_month(date):
+    # простой вариант (можно улучшить позже)
+    return date + timedelta(days=30)
+
+
+# ================= DB =================
 
 async def add_user(tg_id, username):
     async with pool.acquire() as conn:
@@ -57,52 +73,28 @@ async def add_user(tg_id, username):
         """, tg_id, username)
 
 
-async def add_subscription(tg_id, name, amount, date):
+async def add_subscription(tg_id, data):
     async with pool.acquire() as conn:
-
-        user = await conn.fetchrow("""
-            SELECT id FROM users WHERE telegram_id = $1
-        """, tg_id)
-
-        if not user:
-            return
-
-        await conn.execute("""
-            INSERT INTO subscriptions (
-                user_id,
-                name,
-                amount,
-                next_payment_date,
-                currency,
-                billing_period,
-                billing_interval,
-                status
-            )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        """,
-        user["id"],
-        name,
-        amount,
-        date,
-        "RUB",
-        "monthly",
-        1,
-        "active"
+        user = await conn.fetchrow(
+            "SELECT id FROM users WHERE telegram_id=$1", tg_id
         )
 
-
-async def get_all_subscriptions():
-    async with pool.acquire() as conn:
-        return await conn.fetch("""
-            SELECT u.telegram_id, s.name, s.next_payment_date, s.amount
-            FROM subscriptions s
-            JOIN users u ON u.id = s.user_id
-        """)
+        await conn.execute("""
+            INSERT INTO subscriptions
+            (user_id, name, amount, currency, next_payment_date)
+            VALUES ($1,$2,$3,$4,$5)
+        """,
+        user["id"],
+        data["name"],
+        data["amount"],
+        data["currency"],
+        data["date"]
+        )
 
 
 # ================= UI =================
 
-def kb():
+def main_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Добавить")],
@@ -113,85 +105,109 @@ def kb():
     )
 
 
+def cancel_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True
+    )
+
+
+def currency_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="₽ RUB", callback_data="cur_RUB"),
+                InlineKeyboardButton(text="$ USD", callback_data="cur_USD")
+            ]
+        ]
+    )
+
+
 # ================= START =================
 
 @dp.message(Command("start"))
-async def start(message: types.Message):
-    user_states.pop(message.from_user.id, None)
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
     await add_user(message.from_user.id, message.from_user.username)
-    await message.answer("💳 Бот подписок", reply_markup=kb())
+    await message.answer("💳 Бот подписок", reply_markup=main_kb())
 
 
-# ================= FSM =================
+# ================= CANCEL =================
 
-user_states = {}
+@dp.message(lambda m: m.text == "❌ Отмена")
+async def cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Отменено", reply_markup=main_kb())
 
+
+# ================= ADD =================
 
 @dp.message(lambda m: m.text == "➕ Добавить")
-async def add(message: types.Message):
-    user_states[message.from_user.id] = {"step": "name"}
-    await message.answer("Введите название")
+async def add(message: types.Message, state: FSMContext):
+    await state.set_state(AddSub.name)
+    await message.answer("Введите название", reply_markup=cancel_kb())
 
 
-# ================= ОБРАБОТКА =================
+@dp.message(AddSub.name)
+async def get_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(AddSub.amount)
+    await message.answer("Введите сумму")
 
-@dp.message()
-async def handler(message: types.Message):
-    uid = message.from_user.id
 
-    # ❗ игнор кнопок
-    if message.text in ["➕ Добавить", "📋 Список", "📊 Статистика"]:
+@dp.message(AddSub.amount)
+async def get_amount(message: types.Message, state: FSMContext):
+    try:
+        await state.update_data(amount=float(message.text))
+        await state.set_state(AddSub.currency)
+        await message.answer("Выберите валюту:", reply_markup=currency_kb())
+    except:
+        await message.answer("❗ Введите число")
+
+
+@dp.callback_query(lambda c: c.data.startswith("cur_"))
+async def set_currency(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.split("_")[1]
+
+    await state.update_data(currency=currency)
+    await state.set_state(AddSub.date)
+
+    await callback.message.answer("Введите дату (YYYY-MM-DD или DD.MM.YYYY)")
+    await callback.answer()
+
+
+@dp.message(AddSub.date)
+async def get_date(message: types.Message, state: FSMContext):
+    date = parse_date(message.text)
+
+    if not date:
+        await message.answer("❌ Неверная дата")
         return
 
-    if uid not in user_states:
-        return
+    data = await state.get_data()
+    data["date"] = date
 
-    state = user_states[uid]
+    await add_subscription(message.from_user.id, data)
 
-    if state["step"] == "name":
-        state["name"] = message.text
-        state["step"] = "amount"
-        await message.answer("Введите сумму")
-
-    elif state["step"] == "amount":
-        try:
-            state["amount"] = float(message.text)
-            state["step"] = "date"
-            await message.answer("Введите дату (YYYY-MM-DD или DD.MM.YYYY)")
-        except:
-            await message.answer("Введите число")
-
-    elif state["step"] == "date":
-        date = parse_date(message.text)
-
-        if not date:
-            await message.answer("❌ Неверная дата")
-            return
-
-        await add_subscription(
-            uid,
-            state["name"],
-            state["amount"],
-            date
-        )
-
-        user_states.pop(uid, None)
-        await message.answer("✅ Добавлено", reply_markup=kb())
+    await state.clear()
+    await message.answer("✅ Добавлено", reply_markup=main_kb())
 
 
 # ================= LIST =================
 
 @dp.message(lambda m: m.text == "📋 Список")
-async def list_subs(message: types.Message):
-    user_states.pop(message.from_user.id, None)
+async def list_subs(message: types.Message, state: FSMContext):
+    if await state.get_state():
+        await message.answer("⚠️ Сначала заверши ввод")
+        return
 
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT s.name, s.amount, s.next_payment_date
+            SELECT name, amount, currency, next_payment_date
             FROM subscriptions s
             JOIN users u ON u.id = s.user_id
-            WHERE u.telegram_id = $1
-            ORDER BY s.next_payment_date
+            WHERE u.telegram_id=$1
+            ORDER BY next_payment_date
         """, message.from_user.id)
 
     if not rows:
@@ -201,83 +217,65 @@ async def list_subs(message: types.Message):
     text = "📋 Подписки:\n\n"
 
     for r in rows:
-        date = r["next_payment_date"]
-
-        if isinstance(date, datetime):
-            date = date.date()
-
-        text += f"🔹 {r['name']}\n"
-        text += f"   💰 {r['amount']}₽\n"
-        text += f"   📅 {date}\n\n"
+        text += f"{r['name']} — {r['amount']} {r['currency']} ({r['next_payment_date']})\n"
 
     await message.answer(text)
 
 
 # ================= STATS =================
 
-def calc_monthly(amount, period):
-    if period == "monthly":
-        return amount
-    if period == "yearly":
-        return amount / 12
-    if period == "weekly":
-        return amount * 4
-    return amount
-
-
 @dp.message(lambda m: m.text == "📊 Статистика")
-async def stats(message: types.Message):
-    user_states.pop(message.from_user.id, None)
+async def stats(message: types.Message, state: FSMContext):
+    if await state.get_state():
+        await message.answer("⚠️ Сначала заверши ввод")
+        return
 
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT s.amount, s.billing_period
-            FROM subscriptions s
+            SELECT amount FROM subscriptions s
             JOIN users u ON u.id = s.user_id
-            WHERE u.telegram_id = $1
+            WHERE u.telegram_id=$1
         """, message.from_user.id)
 
-    total = sum(calc_monthly(r["amount"], r["billing_period"]) for r in rows)
+    total = sum(r["amount"] for r in rows)
 
-    await message.answer(
-        f"📊 Статистика:\n\n"
-        f"💸 В месяц: {round(total,2)}₽\n"
-        f"📦 Подписок: {len(rows)}"
-    )
+    await message.answer(f"💸 В месяц: {round(total,2)}")
 
 
 # ================= NOTIFICATIONS =================
 
 async def notification_loop():
-    sent = set()
-
     while True:
         try:
-            rows = await get_all_subscriptions()
-            today = datetime.now().date()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT s.id, u.telegram_id, s.name, s.amount, s.currency, s.next_payment_date
+                    FROM subscriptions s
+                    JOIN users u ON u.id = s.user_id
+                """)
 
-            for r in rows:
-                date = r["next_payment_date"]
+                today = datetime.now().date()
 
-                if isinstance(date, datetime):
-                    date = date.date()
+                for r in rows:
+                    if r["next_payment_date"] <= today:
 
-                key = (r["telegram_id"], r["name"], str(date))
+                        await bot.send_message(
+                            r["telegram_id"],
+                            f"⏰ {r['name']} — {r['amount']} {r['currency']}"
+                        )
 
-                if key in sent:
-                    continue
+                        new_date = next_month(r["next_payment_date"])
 
-                if (date - today).days in [0, 1]:
-                    await bot.send_message(
-                        r["telegram_id"],
-                        f"⏰ Напоминание: {r['name']} ({date}) — {r['amount']}₽"
-                    )
-                    sent.add(key)
+                        await conn.execute("""
+                            UPDATE subscriptions
+                            SET next_payment_date=$1
+                            WHERE id=$2
+                        """, new_date, r["id"])
 
         except Exception as e:
-            print("LOOP ERROR:", e)
+            print("ERROR:", e)
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(60)
 
 
 # ================= MAIN =================
