@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.log
+.DS_Store
+venv/
+env/
+.venv/
+.env.local
+.git/
+.gitignore
+README.md
+logs/
+postgres_data/
+backups/

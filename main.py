@@ -1,6 +1,4 @@
 import asyncio
-import json
-import logging
 import re
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -15,25 +13,51 @@ from aiogram.types import (
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from dotenv import load_dotenv
 
 from DB.dbCon import DB_CONFIG
+import logging
+import os
+from logging.handlers import RotatingFileHandler
 
+# Создаём папку для логов если её нет
+os.makedirs("logs", exist_ok=True)
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        # Логи в файл (с ротацией)
+        RotatingFileHandler(
+            "logs/bot.log",
+            maxBytes=10*1024*1024,  # 10 MB
+            backupCount=5,
+            encoding='utf-8'
+        ),
+        # Логи в консоль
+        logging.StreamHandler()
+    ]
+)
 # ================= CONFIG =================
 
-with open('package.json', 'r', encoding='utf-8') as file:
-    data = json.load(file)
+# Загружаем переменные окружения ДО их использования
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=data.get('token'))
+# Проверяем, что токен загружен
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не найден в .env файле!")
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 pool = None
-
 KEYBOARD_VERSION = "4.0"
 MAX_SUBSCRIPTIONS = 50
 
-# Хранилище для rate limiting
 user_actions = defaultdict(list)
 
 
