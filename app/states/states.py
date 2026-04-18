@@ -18,3 +18,11 @@ class EditSub(StatesGroup):
 
 class ResumeSub(StatesGroup):
     waiting_for_date = State()
+
+class AddSub(StatesGroup):
+    name = State()
+    amount = State()
+    currency = State()
+    period = State()
+    period_custom = State()  # ← добавить
+    date = State()

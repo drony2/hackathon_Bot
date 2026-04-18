@@ -27,28 +27,28 @@ async def add_user(tg_id, username, first_name):
 
         return user["id"] if user else None
 
-
 async def add_subscription(tg_id, data):
-    pool = get_pool()
-    async with pool.acquire() as conn:
+
+    async with get_pool().acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
             tg_id
         )
 
         await conn.execute("""
-                           INSERT INTO subscriptions
-                           (user_id, name, amount, currency, next_payment_date, period_days,
-                            reminded_3d, reminded_1d, reminded_today, status)
-                           VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE, FALSE, 'active')
-                           """,
-                           user["id"],
-                           data["name"],
-                           data["amount"],
-                           data["currency"],
-                           data["date"],
-                           data["period"]
-                           )
+            INSERT INTO subscriptions
+            (user_id, name, amount, currency, next_payment_date, period_days,
+             reminded_3d, reminded_1d, reminded_today, status, period_type)
+            VALUES ($1, $2, $3, $4, $5, $6, FALSE, FALSE, FALSE, 'active', $7)
+        """,
+        user["id"],
+        data["name"],
+        data["amount"],
+        data["currency"],
+        data["date"],
+        data["period"],
+        data.get("period_type")  # ← добавить period_type
+        )
 
 async def get_payment_history(tg_id, limit=20):
     pool = get_pool()

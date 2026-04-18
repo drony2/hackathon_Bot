@@ -89,8 +89,8 @@ async def notification_loop():
                 except Exception as e:
                     logging.error(f"Error processing subscription {r['id']}: {e}")
 
-            await asyncio.sleep(600)
+            await asyncio.sleep(60)
 
         except Exception as e:
             logging.error(f"Error in notification loop: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(60)

@@ -114,3 +114,16 @@ def confirm_delete_kb(sub_id):
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"back_to_sub_{sub_id}")
         ]
     ])
+
+def period_kb():
+    """Клавиатура выбора периода"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 1 месяц", callback_data="period_1month")],
+            [InlineKeyboardButton(text="📅 3 месяца", callback_data="period_3month")],
+            [InlineKeyboardButton(text="📅 6 месяцев", callback_data="period_6month")],
+            [InlineKeyboardButton(text="📅 1 год", callback_data="period_1year")],
+            [InlineKeyboardButton(text="🔢 Свой период (дни)", callback_data="period_custom")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
+        ]
+    )
