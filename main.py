@@ -8,12 +8,7 @@ from app.services.notifications import notification_loop
 
 async def main():
     await init_db()
-
-    print("POOL:", db.pool)  # проверка
-
     asyncio.create_task(notification_loop())
-
-    print("✅ Бот запущен!")
 
     try:
         await dp.start_polling(bot)

@@ -4,3 +4,13 @@ from app.config.settings import BOT_TOKEN
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# Просто импортируем модули — хендлеры зарегистрируются сами
+import app.handlers.start
+import app.handlers.subscriptions
+import app.handlers.stats
+import app.handlers.budget
+import app.handlers.payments
+import app.handlers.common
+
+print("✅ Хендлеры импортированы!")

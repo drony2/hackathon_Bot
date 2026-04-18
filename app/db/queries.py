@@ -1,5 +1,6 @@
 from app.config.settings import KEYBOARD_VERSION, MAX_SUBSCRIPTIONS
-from app.db.connection import pool
+from app.db.connection import get_pool
+
 from app.keyboards.keyboards import main_kb
 
 from datetime import datetime
@@ -8,6 +9,7 @@ from aiogram import types
 
 
 async def add_user(tg_id, username, first_name):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow("""
                                    INSERT INTO users (telegram_id, username, first_name)
@@ -27,6 +29,7 @@ async def add_user(tg_id, username, first_name):
 
 
 async def add_subscription(tg_id, data):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -48,6 +51,7 @@ async def add_subscription(tg_id, data):
                            )
 
 async def get_payment_history(tg_id, limit=20):
+    pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
                                 SELECT p.id,
@@ -67,6 +71,7 @@ async def get_payment_history(tg_id, limit=20):
         return rows
 
 async def set_budget(tg_id, currency, monthly_limit):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -92,6 +97,7 @@ async def set_budget(tg_id, currency, monthly_limit):
 
 
 async def get_budget(tg_id, currency=None):
+    pool = get_pool()
     async with pool.acquire() as conn:
         if currency:
             row = await conn.fetchrow("""
@@ -131,6 +137,7 @@ async def check_budget_status(tg_id, currency):
     }
 
 async def add_notification(tg_id, subscription_id, notify_date, notify_type):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -145,7 +152,7 @@ async def add_notification(tg_id, subscription_id, notify_date, notify_type):
 async def check_subscription_exists(tg_id, name):
     """Проверяет, существует ли у пользователя подписка с таким названием"""
     clean_name = " ".join(name.split())
-
+    pool = get_pool()
     async with pool.acquire() as conn:
         exists = await conn.fetchval("""
                                      SELECT EXISTS(SELECT 1
@@ -158,6 +165,7 @@ async def check_subscription_exists(tg_id, name):
 
 
 async def check_subscription_limit(tg_id: int) -> bool:
+    pool = get_pool()
     """Проверяет, не превышен ли лимит подписок"""
     async with pool.acquire() as conn:
         count = await conn.fetchval("""
@@ -170,6 +178,7 @@ async def check_subscription_limit(tg_id: int) -> bool:
 
 
 async def check_and_update_keyboard(user_tg_id: int, message: types.Message = None):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -206,6 +215,7 @@ async def check_and_update_keyboard(user_tg_id: int, message: types.Message = No
 
 
 async def force_update_keyboard(user_tg_id: int):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -221,6 +231,7 @@ async def force_update_keyboard(user_tg_id: int):
                                """, user["id"], KEYBOARD_VERSION)
 
 async def add_payment_record(tg_id, subscription_id, amount, payment_date, status="paid"):
+    pool = get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id FROM users WHERE telegram_id=$1",
@@ -237,7 +248,7 @@ async def get_monthly_spending(tg_id, currency=None, year=None, month=None):
         today = datetime.now()
         year = today.year
         month = today.month
-
+    pool = get_pool()
     async with pool.acquire() as conn:
         query = """
                 SELECT s.currency,

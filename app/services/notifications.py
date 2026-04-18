@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 import logging
 
-import app.db.connection as db  # ✅ ВАЖНО
+import app.db.connection as db
 
 from app.bot import bot
 from app.db.queries import add_notification

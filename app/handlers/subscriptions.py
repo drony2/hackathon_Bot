@@ -4,7 +4,8 @@ from aiogram.fsm.context import FSMContext
 
 from app.bot import dp
 from app.config.settings import MAX_SUBSCRIPTIONS
-from app.db.connection import pool
+from app.db.connection import get_pool
+
 from app.db.queries import check_subscription_limit, check_subscription_exists, add_subscription
 from app.keyboards.keyboards import list_action_kb, cancel_kb, main_kb, currency_kb, edit_fields_kb, confirm_delete_kb
 from aiogram import types
@@ -14,8 +15,11 @@ from app.services.utils import parse_date, rate_limit, validate_subscription_nam
 from app.states.states import ResumeSub, AddSub, EditSub
 
 
+
+
 @dp.callback_query(lambda c: c.data.startswith("pause_"))
 async def pause_subscription(c: types.CallbackQuery):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
@@ -40,6 +44,7 @@ async def pause_subscription(c: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("resume_"))
 async def resume_subscription_start(c: types.CallbackQuery, state: FSMContext):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
@@ -68,6 +73,7 @@ async def resume_subscription_start(c: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ResumeSub.waiting_for_date)
 async def resume_subscription_finish(message: types.Message, state: FSMContext):
+    pool = get_pool()
     if message.text == "❌ Отмена":
         await state.clear()
         return await message.answer("❌ Возобновление отменено", reply_markup=main_kb())
@@ -112,6 +118,7 @@ async def resume_subscription_finish(message: types.Message, state: FSMContext):
 
 @dp.message(lambda m: m.text == "➕ Добавить")
 async def add(message: types.Message, state: FSMContext):
+    pool = get_pool()
     # Проверка rate limit
     if rate_limit(message.from_user.id, "add_sub", max_actions=10, window=60):
         await message.answer("⚠️ Слишком много попыток! Подождите минуту.")
@@ -153,6 +160,7 @@ async def add(message: types.Message, state: FSMContext):
 
 @dp.message(AddSub.name)
 async def name(m: types.Message, state: FSMContext):
+    pool = get_pool()
     if m.text == "❌ Отмена":
         await state.clear()
         return await m.answer("❌ Добавление отменено", reply_markup=main_kb())
@@ -186,6 +194,7 @@ async def name(m: types.Message, state: FSMContext):
 
 @dp.message(AddSub.amount)
 async def amount(message: types.Message, state: FSMContext):
+    pool = get_pool()
     if message.text == "❌ Отмена":
         await state.clear()
         return await message.answer("❌ Добавление отменено", reply_markup=main_kb())
@@ -202,6 +211,7 @@ async def amount(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("cur_"))
 async def currency(c: types.CallbackQuery, state: FSMContext):
+    pool = get_pool()
     await state.update_data(currency=c.data.split("_")[1])
     await state.set_state(AddSub.period)
     await c.message.delete()
@@ -211,6 +221,7 @@ async def currency(c: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AddSub.period)
 async def period(m: types.Message, state: FSMContext):
+    pool = get_pool()
     if m.text == "❌ Отмена":
         await state.clear()
         return await m.answer("❌ Добавление отменено", reply_markup=main_kb())
@@ -232,6 +243,7 @@ async def period(m: types.Message, state: FSMContext):
 
 @dp.message(AddSub.date)
 async def date(m: types.Message, state: FSMContext):
+    pool = get_pool()
     if m.text == "❌ Отмена":
         await state.clear()
         return await m.answer("❌ Добавление отменено", reply_markup=main_kb())
@@ -278,6 +290,9 @@ async def date(m: types.Message, state: FSMContext):
 
 @dp.message(lambda m: m.text == "📋 Список")
 async def list_subs(m: types.Message):
+    pool = get_pool()
+    print(pool)
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
                                 SELECT s.id, s.name, s.amount, s.currency, s.next_payment_date, s.period_days, s.status
@@ -328,6 +343,7 @@ async def list_subs(m: types.Message):
 
 @dp.callback_query(lambda c: c.data.startswith("edit_"))
 async def edit_subscription(c: types.CallbackQuery, state: FSMContext):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[1])
     await state.update_data(edit_sub_id=sub_id)
     await c.message.edit_text(
@@ -338,6 +354,7 @@ async def edit_subscription(c: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("editfield_"))
 async def edit_field(c: types.CallbackQuery, state: FSMContext):
+    pool = get_pool()
     parts = c.data.split("_")
     sub_id = int(parts[1])
     field = parts[2]
@@ -362,6 +379,7 @@ async def edit_field(c: types.CallbackQuery, state: FSMContext):
 
 @dp.message(EditSub.new_value)
 async def save_edited_field(message: types.Message, state: FSMContext):
+    pool = get_pool()
     if message.text == "❌ Отмена":
         await state.clear()
         return await message.answer("❌ Редактирование отменено", reply_markup=main_kb())
@@ -454,6 +472,7 @@ async def save_edited_field(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("del_"))
 async def delete_confirm(c: types.CallbackQuery):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
@@ -468,6 +487,7 @@ async def delete_confirm(c: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("confirmdel_"))
 async def delete_confirmed(c: types.CallbackQuery):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
@@ -520,6 +540,7 @@ async def renew(c: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("skip_"))
 async def skip(c: types.CallbackQuery):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[1])
 
     async with pool.acquire() as conn:
@@ -554,6 +575,7 @@ async def skip(c: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("back_to_sub_"))
 async def back_to_sub(c: types.CallbackQuery):
+    pool = get_pool()
     sub_id = int(c.data.split("_")[3])
 
     async with pool.acquire() as conn:

@@ -2,13 +2,15 @@
 from aiogram import types
 
 from aiogram.fsm.context import FSMContext
-from app.db.connection import pool
+
 from app.bot import dp
+from app.db.connection import get_pool
 from app.keyboards.keyboards import main_kb
 
 
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def stats(message: types.Message, state: FSMContext):
+    pool = get_pool()
     if await state.get_state():
         await message.answer("⚠️ Сначала завершите текущее действие", reply_markup=main_kb())
         return
